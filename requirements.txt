@@ -3,5 +3,8 @@
 openai-whisper
 pydub
 
+# Day 4 - Date parsing
+dateparser
+
 # Testing
 pytest

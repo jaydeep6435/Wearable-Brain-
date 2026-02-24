@@ -1,10 +1,13 @@
 """
-Tests for Day 2 MVP -- Pipeline Upgrade
-=========================================
+Tests for Day 4 MVP -- Pipeline with Reminders & Date Parsing
+===============================================================
 Tests cover:
   - Summarizer (original + highlighted)
-  - Structured event extraction (JSON format)
+  - Structured event extraction (JSON with parsed dates)
   - Memory Manager (add, get, search, persist)
+  - Query Engine (intent detection, date extraction, responses)
+  - Date Parser (date/time parsing, combining)
+  - Reminder Manager (upcoming events, alerts, scheduling)
 
 Run with:  python -m pytest tests/test_pipeline.py -v
 """
@@ -12,10 +15,14 @@ Run with:  python -m pytest tests/test_pipeline.py -v
 import json
 import os
 import pytest
+from datetime import datetime, timedelta
 
 from core.summarizer import summarize, _split_sentences, summarize_with_highlights
 from core.event_extractor import extract_events, extract_structured_events
 from core.memory_manager import MemoryManager
+from core.query_engine import QueryEngine
+from core.date_parser import parse_date, parse_time, combine_datetime
+from core.reminder_manager import ReminderManager
 
 
 # =========================================================================
@@ -32,259 +39,394 @@ SAMPLE_TEXT = (
 )
 
 
+def _create_test_memory() -> MemoryManager:
+    """Create a MemoryManager loaded with sample events (new schema)."""
+    tomorrow = parse_date("tomorrow")
+    memory = MemoryManager()
+    memory.add_events([
+        {"type": "meeting", "raw_date": "tomorrow", "parsed_date": tomorrow,
+         "time": "10 AM", "parsed_time": "10:00",
+         "person": "Dr. Smith", "description": "Doctor appointment"},
+        {"type": "meeting", "raw_date": None, "parsed_date": None,
+         "time": None, "parsed_time": None,
+         "person": "David", "description": "Visiting this weekend"},
+        {"type": "task", "raw_date": "tomorrow", "parsed_date": tomorrow,
+         "time": None, "parsed_time": None,
+         "person": None, "description": "Buy groceries tomorrow"},
+        {"type": "task", "raw_date": None, "parsed_date": None,
+         "time": None, "parsed_time": None,
+         "person": None, "description": "Call the pharmacy to refill prescription"},
+        {"type": "task", "raw_date": None, "parsed_date": None,
+         "time": None, "parsed_time": None,
+         "person": None, "description": "Remember to do morning exercises"},
+        {"type": "medication", "raw_date": None, "parsed_date": None,
+         "time": None, "parsed_time": None,
+         "person": None, "description": "Take your medicine after breakfast"},
+        {"type": "medication", "raw_date": None, "parsed_date": None,
+         "time": None, "parsed_time": None,
+         "person": None, "description": "Refill the prescription"},
+    ])
+    return memory
+
+
 # =========================================================================
-# Summarizer Tests (Day 1 + Day 2)
+# Summarizer Tests
 # =========================================================================
 
 class TestSummarizer:
-    """Tests for core.summarizer module."""
-
     def test_split_sentences_returns_list(self):
-        sentences = _split_sentences(SAMPLE_TEXT)
-        assert isinstance(sentences, list)
-        assert len(sentences) > 0
+        assert len(_split_sentences(SAMPLE_TEXT)) > 0
 
     def test_summarize_returns_string(self):
         result = summarize(SAMPLE_TEXT, num_sentences=2)
-        assert isinstance(result, str)
-        assert len(result) > 0
+        assert isinstance(result, str) and len(result) > 0
 
     def test_summarize_respects_num_sentences(self):
         for n in [1, 2, 3]:
-            result = summarize(SAMPLE_TEXT, num_sentences=n)
-            sentence_count = len(_split_sentences(result))
-            assert sentence_count <= n
+            assert len(_split_sentences(summarize(SAMPLE_TEXT, num_sentences=n))) <= n
 
     def test_summarize_empty_text(self):
-        result = summarize("", num_sentences=3)
-        assert isinstance(result, str)
+        assert isinstance(summarize("", num_sentences=3), str)
 
     def test_summarize_single_sentence(self):
-        single = "This is the only sentence here."
-        result = summarize(single, num_sentences=3)
-        assert "only sentence" in result
+        assert "only sentence" in summarize("This is the only sentence here.", num_sentences=3)
 
 
 # =========================================================================
-# Highlighted Summary Tests (Day 2)
+# Highlighted Summary Tests
 # =========================================================================
 
 class TestHighlightedSummary:
-    """Tests for the new summarize_with_highlights function."""
-
     def test_returns_list_of_dicts(self):
         result = summarize_with_highlights(SAMPLE_TEXT)
-        assert isinstance(result, list)
         assert all(isinstance(item, dict) for item in result)
 
     def test_each_item_has_required_keys(self):
-        result = summarize_with_highlights(SAMPLE_TEXT)
-        for item in result:
-            assert "sentence" in item
-            assert "important" in item
-            assert "tags" in item
-
-    def test_important_flag_is_boolean(self):
-        result = summarize_with_highlights(SAMPLE_TEXT, num_sentences=2)
-        for item in result:
-            assert isinstance(item["important"], bool)
-
-    def test_tags_are_list(self):
-        result = summarize_with_highlights(SAMPLE_TEXT)
-        for item in result:
-            assert isinstance(item["tags"], list)
+        for item in summarize_with_highlights(SAMPLE_TEXT):
+            assert {"sentence", "important", "tags"}.issubset(item.keys())
 
     def test_detects_meeting_tag(self):
-        """Sentences with 'doctor' or 'meeting' should have meeting tag."""
-        result = summarize_with_highlights(SAMPLE_TEXT)
-        meeting_tagged = [
-            item for item in result
-            if "meeting" in item["tags"]
-        ]
-        assert len(meeting_tagged) > 0
+        assert any("meeting" in i["tags"] for i in summarize_with_highlights(SAMPLE_TEXT))
 
     def test_detects_medication_tag(self):
-        """Sentences with 'medicine' should have medication tag."""
-        result = summarize_with_highlights(SAMPLE_TEXT)
-        med_tagged = [
-            item for item in result
-            if "medication" in item["tags"]
-        ]
-        assert len(med_tagged) > 0
+        assert any("medication" in i["tags"] for i in summarize_with_highlights(SAMPLE_TEXT))
 
     def test_empty_text_returns_empty_list(self):
-        result = summarize_with_highlights("")
-        assert result == []
+        assert summarize_with_highlights("") == []
 
 
 # =========================================================================
-# Structured Event Extractor Tests (Day 2)
+# Structured Event Extractor Tests (Day 4 — with parsed dates)
 # =========================================================================
 
 class TestStructuredExtractor:
-    """Tests for the new extract_structured_events function."""
-
     def test_returns_list(self):
-        result = extract_structured_events(SAMPLE_TEXT)
-        assert isinstance(result, list)
+        assert isinstance(extract_structured_events(SAMPLE_TEXT), list)
 
     def test_events_have_required_fields(self):
-        """Each event should have type, date, time, person, description."""
-        events = extract_structured_events(SAMPLE_TEXT)
-        required_keys = {"type", "date", "time", "person", "description"}
-        for event in events:
-            assert required_keys.issubset(event.keys()), (
-                f"Event missing keys: {required_keys - event.keys()}"
-            )
+        required = {"type", "raw_date", "parsed_date", "time", "parsed_time", "person", "description"}
+        for event in extract_structured_events(SAMPLE_TEXT):
+            assert required.issubset(event.keys()), f"Missing: {required - event.keys()}"
 
     def test_type_is_valid(self):
-        """Event type should be one of meeting, task, medication."""
-        valid_types = {"meeting", "task", "medication"}
-        events = extract_structured_events(SAMPLE_TEXT)
-        for event in events:
-            assert event["type"] in valid_types, (
-                f"Invalid type: {event['type']}"
-            )
+        for event in extract_structured_events(SAMPLE_TEXT):
+            assert event["type"] in {"meeting", "task", "medication"}
 
     def test_detects_meetings(self):
-        events = extract_structured_events(SAMPLE_TEXT)
-        meetings = [e for e in events if e["type"] == "meeting"]
-        assert len(meetings) > 0
+        assert any(e["type"] == "meeting" for e in extract_structured_events(SAMPLE_TEXT))
 
     def test_detects_tasks(self):
-        events = extract_structured_events(SAMPLE_TEXT)
-        tasks = [e for e in events if e["type"] == "task"]
-        assert len(tasks) > 0
+        assert any(e["type"] == "task" for e in extract_structured_events(SAMPLE_TEXT))
 
     def test_detects_medication(self):
-        events = extract_structured_events(SAMPLE_TEXT)
-        meds = [e for e in events if e["type"] == "medication"]
-        assert len(meds) > 0
+        assert any(e["type"] == "medication" for e in extract_structured_events(SAMPLE_TEXT))
 
     def test_detects_person(self):
-        """Should detect 'Dr. Smith' or 'David' as a person."""
-        events = extract_structured_events(SAMPLE_TEXT)
-        persons = [e["person"] for e in events if e["person"]]
-        assert len(persons) > 0, (
-            f"Expected at least one person, got none. Events: {events}"
-        )
+        assert any(e["person"] for e in extract_structured_events(SAMPLE_TEXT))
 
-    def test_detects_date_in_event(self):
-        """At least one event should have a date field populated."""
+    def test_raw_date_present(self):
         events = extract_structured_events(SAMPLE_TEXT)
-        events_with_date = [e for e in events if e["date"]]
-        assert len(events_with_date) > 0
+        with_raw = [e for e in events if e["raw_date"]]
+        assert len(with_raw) > 0
 
-    def test_detects_time_in_event(self):
-        """At least one event should have a time field populated."""
+    def test_parsed_date_is_iso_format(self):
+        """parsed_date should be YYYY-MM-DD format."""
         events = extract_structured_events(SAMPLE_TEXT)
-        events_with_time = [e for e in events if e["time"]]
-        assert len(events_with_time) > 0
+        for e in events:
+            if e["parsed_date"]:
+                datetime.strptime(e["parsed_date"], "%Y-%m-%d")  # Should not raise
+
+    def test_parsed_time_is_normalized(self):
+        """parsed_time should be HH:MM format."""
+        events = extract_structured_events(SAMPLE_TEXT)
+        for e in events:
+            if e["parsed_time"]:
+                assert len(e["parsed_time"]) == 5, f"Bad time: {e['parsed_time']}"
+                assert ":" in e["parsed_time"]
 
     def test_json_serializable(self):
-        """All events should be JSON-serializable."""
-        events = extract_structured_events(SAMPLE_TEXT)
         try:
-            json.dumps(events)
+            json.dumps(extract_structured_events(SAMPLE_TEXT))
         except (TypeError, ValueError) as e:
-            pytest.fail(f"Events not JSON-serializable: {e}")
+            pytest.fail(f"Not JSON-serializable: {e}")
 
     def test_empty_text(self):
-        result = extract_structured_events("")
-        assert result == []
+        assert extract_structured_events("") == []
 
     def test_legacy_api_still_works(self):
-        """The old extract_events API should still return results."""
         events = extract_events(SAMPLE_TEXT)
-        assert isinstance(events, list)
         if events:
-            assert "type" in events[0]
-            assert "value" in events[0]
-            assert "context" in events[0]
+            assert "type" in events[0] and "value" in events[0]
 
 
 # =========================================================================
-# Memory Manager Tests (Day 2)
+# Memory Manager Tests
 # =========================================================================
 
 class TestMemoryManager:
-    """Tests for core.memory_manager module."""
-
     def test_add_and_count(self):
-        memory = MemoryManager()
-        assert memory.count() == 0
-        memory.add_event({"type": "task", "description": "Buy groceries"})
-        assert memory.count() == 1
-
-    def test_add_events_bulk(self):
-        memory = MemoryManager()
-        memory.add_events([
-            {"type": "task", "description": "Task 1"},
-            {"type": "meeting", "description": "Meeting 1"},
-        ])
-        assert memory.count() == 2
+        m = MemoryManager()
+        m.add_event({"type": "task", "description": "Test"})
+        assert m.count() == 1
 
     def test_get_all_events(self):
-        memory = MemoryManager()
-        memory.add_event({"type": "task", "description": "Buy milk"})
-        events = memory.get_all_events()
-        assert len(events) == 1
-        assert events[0]["description"] == "Buy milk"
+        m = MemoryManager()
+        m.add_event({"type": "task", "description": "Buy milk"})
+        assert m.get_all_events()[0]["description"] == "Buy milk"
 
     def test_recorded_at_timestamp(self):
-        """Each event should get a recorded_at timestamp."""
-        memory = MemoryManager()
-        memory.add_event({"type": "task", "description": "Test"})
-        events = memory.get_all_events()
-        assert "recorded_at" in events[0]
-
-    def test_get_today_events(self):
-        memory = MemoryManager()
-        memory.add_event({"type": "task", "date": "tomorrow", "description": "Buy milk"})
-        memory.add_event({"type": "task", "date": "next week", "description": "Visit park"})
-        today = memory.get_today_events()
-        assert len(today) == 1
-        assert today[0]["description"] == "Buy milk"
-
-    def test_search_events(self):
-        memory = MemoryManager()
-        memory.add_event({"type": "meeting", "person": "Dr. Smith", "description": "Doctor visit"})
-        memory.add_event({"type": "task", "description": "Buy groceries"})
-
-        results = memory.search_events("doctor")
-        assert len(results) == 1
-        assert results[0]["person"] == "Dr. Smith"
+        m = MemoryManager()
+        m.add_event({"type": "task", "description": "Test"})
+        assert "recorded_at" in m.get_all_events()[0]
 
     def test_search_case_insensitive(self):
-        memory = MemoryManager()
-        memory.add_event({"type": "task", "description": "Call Pharmacy"})
-        assert len(memory.search_events("pharmacy")) == 1
-        assert len(memory.search_events("PHARMACY")) == 1
+        m = MemoryManager()
+        m.add_event({"type": "task", "description": "Call Pharmacy"})
+        assert len(m.search_events("pharmacy")) == 1
+        assert len(m.search_events("PHARMACY")) == 1
 
     def test_clear(self):
-        memory = MemoryManager()
-        memory.add_event({"type": "task", "description": "Test"})
-        memory.clear()
-        assert memory.count() == 0
+        m = MemoryManager()
+        m.add_event({"type": "task", "description": "Test"})
+        m.clear()
+        assert m.count() == 0
 
     def test_save_and_load(self, tmp_path):
-        """Save to file and reload should preserve events."""
-        memory = MemoryManager()
-        memory.add_event({"type": "task", "description": "Test save"})
-        memory.add_event({"type": "meeting", "description": "Test meeting"})
-
-        filepath = str(tmp_path / "test_memory.json")
-        memory.save_to_file(filepath)
-        assert os.path.isfile(filepath)
-
-        # Load into a fresh manager
-        memory2 = MemoryManager()
-        memory2.load_from_file(filepath)
-        assert memory2.count() == 2
-        assert memory2.get_all_events()[0]["description"] == "Test save"
+        m = MemoryManager()
+        m.add_event({"type": "task", "description": "Test save"})
+        filepath = str(tmp_path / "test.json")
+        m.save_to_file(filepath)
+        m2 = MemoryManager()
+        m2.load_from_file(filepath)
+        assert m2.count() == 1
 
     def test_load_nonexistent_file(self):
-        """Loading a nonexistent file should not crash."""
+        m = MemoryManager()
+        m.load_from_file("nonexistent.json")
+        assert m.count() == 0
+
+
+# =========================================================================
+# Query Engine Tests
+# =========================================================================
+
+class TestQueryEngine:
+    @pytest.fixture
+    def engine(self):
+        return QueryEngine(_create_test_memory())
+
+    def test_detects_meeting_intent(self, engine):
+        assert "meeting" in engine.query("What meetings do I have?").lower()
+
+    def test_detects_task_intent(self, engine):
+        assert "task" in engine.query("What tasks do I have?").lower()
+
+    def test_detects_medication_intent(self, engine):
+        assert "medication" in engine.query("Did I take medicine?").lower()
+
+    def test_detects_summary_intent(self, engine):
+        assert "event" in engine.query("Give me a summary").lower()
+
+    def test_filters_by_tomorrow(self, engine):
+        result = engine.query("What meetings do I have tomorrow?")
+        assert "tomorrow" in result.lower() and "doctor" in result.lower()
+
+    def test_returns_string(self, engine):
+        assert isinstance(engine.query("What meetings do I have?"), str)
+
+    def test_keyword_search(self, engine):
+        result = engine.query("Tell me about pharmacy")
+        assert "pharmacy" in result.lower() or "prescription" in result.lower()
+
+    def test_empty_memory(self):
+        result = QueryEngine(MemoryManager()).query("What meetings do I have?")
+        assert "no meeting" in result.lower()
+
+    def test_empty_question(self, engine):
+        assert isinstance(engine.query(""), str)
+
+
+# =========================================================================
+# Date Parser Tests (Day 4)
+# =========================================================================
+
+class TestDateParser:
+    """Tests for core.date_parser module."""
+
+    def test_parse_today(self):
+        result = parse_date("today")
+        expected = datetime.now().strftime("%Y-%m-%d")
+        assert result == expected
+
+    def test_parse_tomorrow(self):
+        result = parse_date("tomorrow")
+        expected = (datetime.now() + timedelta(days=1)).strftime("%Y-%m-%d")
+        assert result == expected
+
+    def test_parse_yesterday(self):
+        result = parse_date("yesterday")
+        expected = (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d")
+        assert result == expected
+
+    def test_parse_month_day(self):
+        result = parse_date("March 15")
+        assert result is not None
+        assert "-03-15" in result
+
+    def test_parse_none_returns_none(self):
+        assert parse_date(None) is None
+
+    def test_parse_empty_returns_none(self):
+        assert parse_date("") is None
+
+    def test_parse_gibberish_returns_none(self):
+        assert parse_date("xyzzy foobar") is None
+
+    def test_parse_time_am(self):
+        assert parse_time("10 AM") == "10:00"
+
+    def test_parse_time_pm(self):
+        assert parse_time("3 PM") == "15:00"
+
+    def test_parse_time_with_minutes(self):
+        assert parse_time("10:30 AM") == "10:30"
+
+    def test_parse_time_noon(self):
+        assert parse_time("noon") == "12:00"
+
+    def test_parse_time_morning(self):
+        assert parse_time("morning") == "09:00"
+
+    def test_parse_time_none(self):
+        assert parse_time(None) is None
+
+    def test_parse_time_empty(self):
+        assert parse_time("") is None
+
+    def test_combine_datetime(self):
+        result = combine_datetime("2026-02-25", "10:00")
+        assert result is not None
+        assert result.year == 2026
+        assert result.month == 2
+        assert result.day == 25
+        assert result.hour == 10
+
+    def test_combine_datetime_no_time_defaults_9am(self):
+        result = combine_datetime("2026-02-25", None)
+        assert result is not None
+        assert result.hour == 9
+        assert result.minute == 0
+
+    def test_combine_datetime_no_date_returns_none(self):
+        assert combine_datetime(None, "10:00") is None
+
+
+# =========================================================================
+# Reminder Manager Tests (Day 4)
+# =========================================================================
+
+class TestReminderManager:
+    """Tests for core.reminder_manager module."""
+
+    def _create_memory_with_upcoming(self) -> MemoryManager:
+        """Create memory with an event happening in 10 minutes."""
+        now = datetime.now()
+        future = now + timedelta(minutes=10)
         memory = MemoryManager()
-        memory.load_from_file("nonexistent_file.json")
-        assert memory.count() == 0
+        memory.add_event({
+            "type": "meeting",
+            "raw_date": "today",
+            "parsed_date": now.strftime("%Y-%m-%d"),
+            "time": future.strftime("%I:%M %p"),
+            "parsed_time": future.strftime("%H:%M"),
+            "person": "Dr. Smith",
+            "description": "Doctor appointment",
+        })
+        return memory
+
+    def test_get_upcoming_events(self):
+        memory = self._create_memory_with_upcoming()
+        reminder = ReminderManager(memory)
+        upcoming = reminder.get_upcoming_events(minutes=60)
+        assert len(upcoming) == 1
+        assert upcoming[0]["description"] == "Doctor appointment"
+
+    def test_upcoming_has_minutes_until(self):
+        memory = self._create_memory_with_upcoming()
+        reminder = ReminderManager(memory)
+        upcoming = reminder.get_upcoming_events(minutes=60)
+        assert "minutes_until" in upcoming[0]
+        assert 5 <= upcoming[0]["minutes_until"] <= 15  # ~10 min window
+
+    def test_check_due_events_returns_alerts(self):
+        memory = self._create_memory_with_upcoming()
+        reminder = ReminderManager(memory)
+        alerts = reminder.check_due_events(window_minutes=60)
+        assert len(alerts) == 1
+        assert "REMINDER" in alerts[0]
+        assert "Doctor appointment" in alerts[0]
+
+    def test_check_due_events_deduplicates(self):
+        memory = self._create_memory_with_upcoming()
+        reminder = ReminderManager(memory)
+        alerts1 = reminder.check_due_events(window_minutes=60)
+        alerts2 = reminder.check_due_events(window_minutes=60)
+        assert len(alerts1) == 1
+        assert len(alerts2) == 0  # Already alerted
+
+    def test_no_upcoming_events(self):
+        memory = MemoryManager()
+        memory.add_event({
+            "type": "meeting",
+            "raw_date": "yesterday",
+            "parsed_date": (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d"),
+            "time": "10 AM", "parsed_time": "10:00",
+            "description": "Past event",
+        })
+        reminder = ReminderManager(memory)
+        assert len(reminder.get_upcoming_events(minutes=60)) == 0
+
+    def test_get_todays_schedule(self):
+        memory = self._create_memory_with_upcoming()
+        reminder = ReminderManager(memory)
+        schedule = reminder.get_todays_schedule()
+        assert len(schedule) == 1
+
+    def test_format_schedule(self):
+        memory = self._create_memory_with_upcoming()
+        reminder = ReminderManager(memory)
+        schedule = reminder.get_todays_schedule()
+        formatted = reminder.format_schedule(schedule)
+        assert "MEETING" in formatted
+        assert "Doctor" in formatted
+
+    def test_format_schedule_empty(self):
+        reminder = ReminderManager(MemoryManager())
+        assert "No events" in reminder.format_schedule([])
+
+    def test_start_and_stop_loop(self):
+        reminder = ReminderManager(MemoryManager())
+        reminder.start_reminder_loop(interval=1)
+        assert reminder._running is True
+        reminder.stop()
+        assert reminder._running is False

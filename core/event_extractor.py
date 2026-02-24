@@ -1,18 +1,20 @@
 """
-Event Extractor Module — Text -> Structured Events (v2)
+Event Extractor Module — Text → Structured Events (v3)
 ========================================================
 Scans transcribed text and returns structured JSON events with fields:
-  type, date, time, person, description
+  type, raw_date, parsed_date, time, parsed_time, person, description
 
 Detection methods:
   - Regex patterns for dates, times, meetings, tasks, medications
   - Person detection via capitalized names and title prefixes
   - Cross-referencing within the same sentence for richer output
+  - Real date parsing via dateparser (Day 4 upgrade)
 
 All detection is regex + keyword based — no ML model required.
 """
 
 import re
+from core.date_parser import parse_date, parse_time
 
 
 # =========================================================================
@@ -117,6 +119,24 @@ def _find_all_matches(text: str, patterns: list[str]) -> list[tuple[str, str]]:
     return results
 
 
+def _build_event(event_type: str, value: str, sentence: str) -> dict:
+    """Build a structured event dict with parsed date/time fields."""
+    raw_date = _find_in_sentence(sentence, DATE_PATTERNS)
+    raw_time = _find_in_sentence(sentence, TIME_PATTERNS)
+    persons = _find_persons(sentence)
+    desc = value[0].upper() + value[1:]  # Capitalize first letter
+
+    return {
+        "type": event_type,
+        "raw_date": raw_date,
+        "parsed_date": parse_date(raw_date),
+        "time": raw_time,
+        "parsed_time": parse_time(raw_time),
+        "person": persons[0] if persons else None,
+        "description": desc,
+    }
+
+
 # =========================================================================
 # Public API
 # =========================================================================
@@ -127,8 +147,10 @@ def extract_structured_events(text: str) -> list[dict]:
 
     Returns a list of event dicts, each with:
         "type"        : meeting | task | medication
-        "date"        : detected date string or None
-        "time"        : detected time string or None
+        "raw_date"    : original date text or None
+        "parsed_date" : ISO date string (YYYY-MM-DD) or None
+        "time"        : original time text or None
+        "parsed_time" : normalized time (HH:MM) or None
         "person"      : detected person name or None
         "description" : human-readable description of the event
     """
@@ -137,54 +159,24 @@ def extract_structured_events(text: str) -> list[dict]:
 
     # --- Process meeting patterns -----------------------------------------
     for value, sentence in _find_all_matches(text, MEETING_PATTERNS):
-        date = _find_in_sentence(sentence, DATE_PATTERNS)
-        time = _find_in_sentence(sentence, TIME_PATTERNS)
-        persons = _find_persons(sentence)
-        desc = value[0].upper() + value[1:]  # Capitalize first letter
-
-        if desc.lower() not in seen_descriptions:
-            seen_descriptions.add(desc.lower())
-            events.append({
-                "type": "meeting",
-                "date": date,
-                "time": time,
-                "person": persons[0] if persons else None,
-                "description": desc,
-            })
+        event = _build_event("meeting", value, sentence)
+        if event["description"].lower() not in seen_descriptions:
+            seen_descriptions.add(event["description"].lower())
+            events.append(event)
 
     # --- Process task patterns --------------------------------------------
     for value, sentence in _find_all_matches(text, TASK_PATTERNS):
-        date = _find_in_sentence(sentence, DATE_PATTERNS)
-        time = _find_in_sentence(sentence, TIME_PATTERNS)
-        persons = _find_persons(sentence)
-        desc = value[0].upper() + value[1:]
-
-        if desc.lower() not in seen_descriptions:
-            seen_descriptions.add(desc.lower())
-            events.append({
-                "type": "task",
-                "date": date,
-                "time": time,
-                "person": persons[0] if persons else None,
-                "description": desc,
-            })
+        event = _build_event("task", value, sentence)
+        if event["description"].lower() not in seen_descriptions:
+            seen_descriptions.add(event["description"].lower())
+            events.append(event)
 
     # --- Process medication patterns --------------------------------------
     for value, sentence in _find_all_matches(text, MEDICATION_PATTERNS):
-        date = _find_in_sentence(sentence, DATE_PATTERNS)
-        time = _find_in_sentence(sentence, TIME_PATTERNS)
-        persons = _find_persons(sentence)
-        desc = value[0].upper() + value[1:]
-
-        if desc.lower() not in seen_descriptions:
-            seen_descriptions.add(desc.lower())
-            events.append({
-                "type": "medication",
-                "date": date,
-                "time": time,
-                "person": persons[0] if persons else None,
-                "description": desc,
-            })
+        event = _build_event("medication", value, sentence)
+        if event["description"].lower() not in seen_descriptions:
+            seen_descriptions.add(event["description"].lower())
+            events.append(event)
 
     return events
 

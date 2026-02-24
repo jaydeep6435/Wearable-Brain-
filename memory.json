@@ -1,98 +1,122 @@
 [
   {
     "type": "meeting",
-    "date": "tomorrow",
+    "raw_date": "tomorrow",
+    "parsed_date": "2026-02-26",
     "time": "10 AM",
+    "parsed_time": "10:00",
     "person": null,
     "description": "Doctor appointment",
-    "recorded_at": "2026-02-24T23:34:13.298745"
+    "recorded_at": "2026-02-25T00:10:19.486124"
   },
   {
     "type": "meeting",
-    "date": null,
+    "raw_date": null,
+    "parsed_date": null,
     "time": null,
+    "parsed_time": null,
     "person": null,
     "description": "Clinic",
-    "recorded_at": "2026-02-24T23:34:13.298767"
+    "recorded_at": "2026-02-25T00:10:19.486134"
   },
   {
     "type": "meeting",
-    "date": null,
+    "raw_date": null,
+    "parsed_date": null,
     "time": null,
+    "parsed_time": null,
     "person": null,
     "description": "Therapist",
-    "recorded_at": "2026-02-24T23:34:13.298768"
+    "recorded_at": "2026-02-25T00:10:19.486138"
   },
   {
     "type": "meeting",
-    "date": null,
+    "raw_date": null,
+    "parsed_date": null,
     "time": null,
+    "parsed_time": null,
     "person": "David",
     "description": "Visiting this weekend",
-    "recorded_at": "2026-02-24T23:34:13.298770"
+    "recorded_at": "2026-02-25T00:10:19.486140"
   },
   {
     "type": "task",
-    "date": null,
+    "raw_date": null,
+    "parsed_date": null,
     "time": null,
+    "parsed_time": null,
     "person": null,
     "description": "Don't forget to take your medicine after breakfast",
-    "recorded_at": "2026-02-24T23:34:13.298770"
+    "recorded_at": "2026-02-25T00:10:19.486141"
   },
   {
     "type": "task",
-    "date": null,
+    "raw_date": null,
+    "parsed_date": null,
     "time": null,
+    "parsed_time": null,
     "person": null,
     "description": "Need to call the pharmacy to refill the prescription before Thursday",
-    "recorded_at": "2026-02-24T23:34:13.298771"
+    "recorded_at": "2026-02-25T00:10:19.486143"
   },
   {
     "type": "task",
-    "date": null,
+    "raw_date": null,
+    "parsed_date": null,
     "time": null,
+    "parsed_time": null,
     "person": null,
     "description": "Remember to do your morning exercises before lunch",
-    "recorded_at": "2026-02-24T23:34:13.298772"
+    "recorded_at": "2026-02-25T00:10:19.486144"
   },
   {
     "type": "task",
-    "date": "tomorrow",
+    "raw_date": "tomorrow",
+    "parsed_date": "2026-02-26",
     "time": null,
+    "parsed_time": null,
     "person": null,
     "description": "Buy groceries tomorrow",
-    "recorded_at": "2026-02-24T23:34:13.298773"
+    "recorded_at": "2026-02-25T00:10:19.486146"
   },
   {
     "type": "task",
-    "date": null,
+    "raw_date": null,
+    "parsed_date": null,
     "time": null,
+    "parsed_time": null,
     "person": null,
     "description": "Finish your tea",
-    "recorded_at": "2026-02-24T23:34:13.298774"
+    "recorded_at": "2026-02-25T00:10:19.486147"
   },
   {
     "type": "medication",
-    "date": null,
+    "raw_date": null,
+    "parsed_date": null,
     "time": null,
+    "parsed_time": null,
     "person": null,
     "description": "Take your medicine",
-    "recorded_at": "2026-02-24T23:34:13.298774"
+    "recorded_at": "2026-02-25T00:10:19.486149"
   },
   {
     "type": "medication",
-    "date": null,
+    "raw_date": null,
+    "parsed_date": null,
     "time": null,
+    "parsed_time": null,
     "person": null,
     "description": "Refill the prescription",
-    "recorded_at": "2026-02-24T23:34:13.298775"
+    "recorded_at": "2026-02-25T00:10:19.486150"
   },
   {
     "type": "medication",
-    "date": null,
+    "raw_date": null,
+    "parsed_date": null,
     "time": null,
+    "parsed_time": null,
     "person": null,
     "description": "Medicine after breakfast",
-    "recorded_at": "2026-02-24T23:34:13.298776"
+    "recorded_at": "2026-02-25T00:10:19.486151"
   }
 ]
