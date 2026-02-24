@@ -75,6 +75,8 @@ def process_audio():
         audio_file.save(tmp.name)
         tmp_path = tmp.name
 
+    use_llm = request.args.get("use_llm", "false").lower() == "true"
+
     try:
         # Step 1: Transcribe
         from core.transcriber import transcribe_audio
@@ -82,11 +84,11 @@ def process_audio():
         text = result["text"]
 
         # Step 2: Summarize
-        summary = summarize(text, num_sentences=3)
+        summary = summarize(text, num_sentences=3, use_llm=use_llm)
         highlights = summarize_with_highlights(text, num_sentences=3)
 
         # Step 3: Extract events
-        events = extract_structured_events(text)
+        events = extract_structured_events(text, use_llm=use_llm)
 
         # Step 4: Store in memory
         memory.add_events(events)
@@ -98,6 +100,7 @@ def process_audio():
             "summary": summary,
             "highlights": highlights,
             "events": events,
+            "llm_used": use_llm,
             "total_events_in_memory": memory.count(),
         })
 
@@ -131,12 +134,14 @@ def process_text():
     if not text:
         return jsonify({"error": "Text is empty."}), 400
 
+    use_llm = request.args.get("use_llm", "false").lower() == "true"
+
     # Step 1: Summarize
-    summary = summarize(text, num_sentences=3)
+    summary = summarize(text, num_sentences=3, use_llm=use_llm)
     highlights = summarize_with_highlights(text, num_sentences=3)
 
     # Step 2: Extract events
-    events = extract_structured_events(text)
+    events = extract_structured_events(text, use_llm=use_llm)
 
     # Step 3: Store in memory
     memory.add_events(events)
@@ -147,6 +152,7 @@ def process_text():
         "summary": summary,
         "highlights": highlights,
         "events": events,
+        "llm_used": use_llm,
         "total_events_in_memory": memory.count(),
     })
 
@@ -171,12 +177,14 @@ def query():
     if not question:
         return jsonify({"error": "Question is empty."}), 400
 
-    answer = query_engine.query(question)
+    use_llm = request.args.get("use_llm", "false").lower() == "true"
+    answer = query_engine.query(question, use_llm=use_llm)
 
     return jsonify({
         "status": "success",
         "question": question,
         "answer": answer,
+        "llm_used": use_llm,
     })
 
 
@@ -251,17 +259,43 @@ def index():
     """API info and health check."""
     return jsonify({
         "app": "Conversational Memory Assistant API",
-        "version": "Day 5 MVP",
+        "version": "Day 7 — Hybrid LLM",
         "status": "running",
         "events_in_memory": memory.count(),
         "endpoints": {
-            "POST /process_audio": "Upload audio file → transcription + summary + events",
-            "POST /process_text": "Send text → summary + events",
-            "POST /query": "Ask a question → get answer",
-            "GET /events": "Get all stored events (?type=meeting&search=keyword)",
-            "GET /reminders": "Get upcoming reminders (?minutes=60)",
+            "POST /process_audio": "Upload audio (?use_llm=true)",
+            "POST /process_text": "Send text (?use_llm=true)",
+            "POST /query": "Ask a question (?use_llm=true)",
+            "GET /events": "All events (?type=meeting&search=keyword)",
+            "GET /reminders": "Upcoming reminders (?minutes=60)",
+            "GET /llm/status": "Check Ollama LLM status",
         },
     })
+
+
+# =========================================================================
+# GET /llm/status — Check LLM availability
+# =========================================================================
+
+@app.route("/llm/status", methods=["GET"])
+def llm_status():
+    """Check if the local LLM (Ollama) is running and available."""
+    try:
+        from core.llm_engine import is_available, get_models, OLLAMA_URL, DEFAULT_MODEL
+        available = is_available()
+        models = get_models() if available else []
+        return jsonify({
+            "status": "online" if available else "offline",
+            "ollama_url": OLLAMA_URL,
+            "default_model": DEFAULT_MODEL,
+            "available_models": models,
+            "instructions": None if available else "Install Ollama from https://ollama.com then run: ollama pull phi3",
+        })
+    except Exception as e:
+        return jsonify({
+            "status": "error",
+            "error": str(e),
+        })
 
 
 # =========================================================================

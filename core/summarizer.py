@@ -72,17 +72,19 @@ def _score_sentence(sentence: str, word_freq: Counter) -> float:
     return score / len(words)
 
 
-def summarize(text: str, num_sentences: int = 3) -> str:
+def summarize(text: str, num_sentences: int = 3, use_llm: bool = False) -> str:
     """
     Generate an extractive summary of the given text.
 
     Args:
         text           : The full text to summarize.
         num_sentences  : How many sentences to include in the summary.
+        use_llm        : If True, append an LLM-generated summary.
 
     Returns:
         A string containing the top-N most important sentences,
-        presented in their original order.
+        presented in their original order. If use_llm is True,
+        an LLM summary is appended.
     """
     # Step 1: Split into sentences
     sentences = _split_sentences(text)
@@ -103,7 +105,21 @@ def summarize(text: str, num_sentences: int = 3) -> str:
     # Step 5: Re-order by original position so the summary reads naturally
     top_n.sort(key=lambda x: x[0])
 
-    return " ".join(sent for _, sent, _ in top_n)
+    extractive = " ".join(sent for _, sent, _ in top_n)
+
+    # Step 6 (optional): Use LLM for a better summary
+    if use_llm:
+        try:
+            from core.llm_engine import summarize_llm, is_available
+            if is_available():
+                llm_summary = summarize_llm(text)
+                if llm_summary:
+                    # Return LLM summary as primary, extractive as reference
+                    return llm_summary
+        except Exception:
+            pass  # LLM failed — return extractive only
+
+    return extractive
 
 
 # -- Importance tagging keywords (for highlighting) -------------------------

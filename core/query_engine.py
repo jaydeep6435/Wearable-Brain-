@@ -89,12 +89,13 @@ class QueryEngine:
 
     # -- Main query method -------------------------------------------------
 
-    def query(self, question: str) -> str:
+    def query(self, question: str, use_llm: bool = False) -> str:
         """
         Process a natural language question and return a human-readable answer.
 
         Args:
             question: The user's question string.
+            use_llm:  If True, use LLM when rule-based fails.
 
         Returns:
             A formatted answer string.
@@ -109,21 +110,60 @@ class QueryEngine:
 
         # Step 3: Route to the appropriate handler
         if intent == "meeting":
-            return self._handle_meeting_query(date_filter)
+            result = self._handle_meeting_query(date_filter)
         elif intent == "task":
-            return self._handle_task_query(date_filter)
+            result = self._handle_task_query(date_filter)
         elif intent == "medication":
-            return self._handle_medication_query(date_filter)
+            result = self._handle_medication_query(date_filter)
         elif intent == "summary":
             # If the query has specific nouns beyond summary keywords,
             # try keyword search first (e.g. "tell me about pharmacy")
             search_result = self._handle_search_query(question_lower)
             if "no events found" not in search_result.lower():
-                return search_result
-            return self._handle_summary_query(date_filter)
+                result = search_result
+            else:
+                result = self._handle_summary_query(date_filter)
         else:
             # Fallback: keyword search using the most meaningful words
-            return self._handle_search_query(question_lower)
+            result = self._handle_search_query(question_lower)
+
+        # Step 4: If LLM is enabled, always use it for a smarter answer
+        if use_llm:
+            try:
+                from core.llm_engine import answer_query_llm, is_available
+                if is_available():
+                    context = self._format_memory_context()
+                    llm_answer = answer_query_llm(question, context)
+                    if llm_answer:
+                        return llm_answer
+            except Exception:
+                pass  # LLM failed — return rule-based result
+
+        return result
+
+    def _format_memory_context(self) -> str:
+        """Format stored events as a text block for LLM context."""
+        events = self.memory.get_all_events()
+        if not events:
+            return "No events stored in memory."
+
+        lines = []
+        for e in events[-20:]:  # Last 20 events to keep context manageable
+            desc = e.get("description", "Unknown")
+            etype = e.get("type", "event")
+            date = e.get("parsed_date") or e.get("raw_date") or ""
+            time = e.get("parsed_time") or e.get("time") or ""
+            person = e.get("person") or ""
+            line = f"- [{etype.upper()}] {desc}"
+            if date:
+                line += f" (Date: {date})"
+            if time:
+                line += f" (Time: {time})"
+            if person:
+                line += f" (Person: {person})"
+            lines.append(line)
+
+        return "\n".join(lines)
 
     # -- Intent detection --------------------------------------------------
 

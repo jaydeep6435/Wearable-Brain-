@@ -10,5 +10,8 @@ dateparser
 flask
 flask-cors
 
+# Day 7 - Local LLM (Ollama HTTP client)
+requests
+
 # Testing
 pytest

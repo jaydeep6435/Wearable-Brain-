@@ -141,9 +141,13 @@ def _build_event(event_type: str, value: str, sentence: str) -> dict:
 # Public API
 # =========================================================================
 
-def extract_structured_events(text: str) -> list[dict]:
+def extract_structured_events(text: str, use_llm: bool = False) -> list[dict]:
     """
     Extract structured events from the given text.
+
+    Args:
+        text    : Conversation text to extract events from.
+        use_llm : If True, use LLM as fallback when rule-based finds few events.
 
     Returns a list of event dicts, each with:
         "type"        : meeting | task | medication
@@ -177,6 +181,29 @@ def extract_structured_events(text: str) -> list[dict]:
         if event["description"].lower() not in seen_descriptions:
             seen_descriptions.add(event["description"].lower())
             events.append(event)
+
+    # --- LLM enhancement (always runs when enabled) -------------------------
+    if use_llm:
+        try:
+            from core.llm_engine import extract_events_llm, is_available
+            if is_available():
+                llm_events = extract_events_llm(text)
+                if llm_events:
+                    for e in llm_events:
+                        desc = (e.get("description") or "").lower()
+                        if desc and desc not in seen_descriptions:
+                            seen_descriptions.add(desc)
+                            # Ensure required fields exist
+                            e.setdefault("type", "task")
+                            e.setdefault("raw_date", None)
+                            e.setdefault("parsed_date", parse_date(e.get("raw_date")))
+                            e.setdefault("time", None)
+                            e.setdefault("parsed_time", parse_time(e.get("time")))
+                            e.setdefault("person", None)
+                            e["source"] = "llm"
+                            events.append(e)
+        except Exception:
+            pass  # LLM failed — keep rule-based results
 
     return events
 

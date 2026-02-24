@@ -1,6 +1,7 @@
 /// Query Screen — Ask questions about stored memories
 ///
 /// Chat-like interface for natural language queries.
+/// Toggle switch enables LLM-powered answers via Ollama.
 
 import 'package:flutter/material.dart';
 import '../services/api_service.dart';
@@ -16,6 +17,7 @@ class _QueryScreenState extends State<QueryScreen> {
   final TextEditingController _questionController = TextEditingController();
   final List<Map<String, String>> _messages = [];
   bool _isLoading = false;
+  bool _useLlm = false;
 
   final List<String> _suggestions = [
     'What meetings do I have tomorrow?',
@@ -36,7 +38,7 @@ class _QueryScreenState extends State<QueryScreen> {
     _questionController.clear();
 
     try {
-      final result = await ApiService.queryMemory(question);
+      final result = await ApiService.queryMemory(question, useLlm: _useLlm);
       setState(() {
         _messages.add({'role': 'bot', 'text': result['answer'] ?? 'No answer'});
       });
@@ -55,6 +57,36 @@ class _QueryScreenState extends State<QueryScreen> {
       appBar: AppBar(
         title: const Text('Ask Memory'),
         centerTitle: true,
+        actions: [
+          // LLM toggle in app bar
+          Padding(
+            padding: const EdgeInsets.only(right: 4),
+            child: Row(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Icon(
+                  _useLlm ? Icons.auto_awesome : Icons.flash_on,
+                  size: 16,
+                  color: _useLlm ? Colors.deepPurple : Colors.grey,
+                ),
+                const SizedBox(width: 2),
+                Text(
+                  _useLlm ? 'AI' : 'Fast',
+                  style: TextStyle(
+                    fontSize: 11,
+                    color: _useLlm ? Colors.deepPurple : Colors.grey,
+                  ),
+                ),
+                Switch(
+                  value: _useLlm,
+                  onChanged: (val) => setState(() => _useLlm = val),
+                  activeThumbColor: Colors.deepPurple,
+                  materialTapTargetSize: MaterialTapTargetSize.shrinkWrap,
+                ),
+              ],
+            ),
+          ),
+        ],
       ),
       body: Column(
         children: [
@@ -65,9 +97,9 @@ class _QueryScreenState extends State<QueryScreen> {
               child: Column(
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
-                  const Text(
-                    '💡 Try asking:',
-                    style: TextStyle(fontWeight: FontWeight.bold),
+                  Text(
+                    _useLlm ? '🤖 AI Mode — Try asking:' : '💡 Try asking:',
+                    style: const TextStyle(fontWeight: FontWeight.bold),
                   ),
                   const SizedBox(height: 8),
                   Wrap(
@@ -133,9 +165,21 @@ class _QueryScreenState extends State<QueryScreen> {
 
           // Loading indicator
           if (_isLoading)
-            const Padding(
-              padding: EdgeInsets.all(8),
-              child: LinearProgressIndicator(),
+            Padding(
+              padding: const EdgeInsets.all(8),
+              child: Column(
+                children: [
+                  const LinearProgressIndicator(),
+                  if (_useLlm)
+                    const Padding(
+                      padding: EdgeInsets.only(top: 4),
+                      child: Text(
+                        '🤖 AI is thinking...',
+                        style: TextStyle(fontSize: 11, color: Colors.grey),
+                      ),
+                    ),
+                ],
+              ),
             ),
 
           // Input bar
@@ -157,7 +201,7 @@ class _QueryScreenState extends State<QueryScreen> {
                   child: TextField(
                     controller: _questionController,
                     decoration: InputDecoration(
-                      hintText: 'Ask a question...',
+                      hintText: _useLlm ? 'Ask AI anything...' : 'Ask a question...',
                       border: OutlineInputBorder(
                         borderRadius: BorderRadius.circular(24),
                       ),
@@ -176,6 +220,9 @@ class _QueryScreenState extends State<QueryScreen> {
                       ? null
                       : () => _askQuestion(_questionController.text),
                   icon: const Icon(Icons.send),
+                  style: _useLlm
+                      ? IconButton.styleFrom(backgroundColor: Colors.deepPurple)
+                      : null,
                 ),
               ],
             ),

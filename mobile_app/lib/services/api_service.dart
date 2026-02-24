@@ -18,9 +18,12 @@ class ApiService {
   }
 
   // -- POST /process_text -------------------------------------------------
-  static Future<Map<String, dynamic>> processText(String text) async {
+  static Future<Map<String, dynamic>> processText(String text, {bool useLlm = false}) async {
+    String url = '$baseUrl/process_text';
+    if (useLlm) url += '?use_llm=true';
+
     final response = await http.post(
-      Uri.parse('$baseUrl/process_text'),
+      Uri.parse(url),
       headers: {'Content-Type': 'application/json'},
       body: jsonEncode({'text': text}),
     );
@@ -33,9 +36,12 @@ class ApiService {
   }
 
   // -- POST /query --------------------------------------------------------
-  static Future<Map<String, dynamic>> queryMemory(String question) async {
+  static Future<Map<String, dynamic>> queryMemory(String question, {bool useLlm = false}) async {
+    String url = '$baseUrl/query';
+    if (useLlm) url += '?use_llm=true';
+
     final response = await http.post(
-      Uri.parse('$baseUrl/query'),
+      Uri.parse(url),
       headers: {'Content-Type': 'application/json'},
       body: jsonEncode({'question': question}),
     );
@@ -44,6 +50,21 @@ class ApiService {
       return jsonDecode(response.body);
     } else {
       throw Exception('Failed to query: ${response.body}');
+    }
+  }
+
+  // -- GET /llm/status ----------------------------------------------------
+  static Future<Map<String, dynamic>> checkLlmStatus() async {
+    try {
+      final response = await http
+          .get(Uri.parse('$baseUrl/llm/status'))
+          .timeout(const Duration(seconds: 5));
+      if (response.statusCode == 200) {
+        return jsonDecode(response.body);
+      }
+      return {'status': 'error'};
+    } catch (_) {
+      return {'status': 'error'};
     }
   }
 
