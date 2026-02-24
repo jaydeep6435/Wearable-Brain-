@@ -6,5 +6,9 @@ pydub
 # Day 4 - Date parsing
 dateparser
 
+# Day 5 - Flask API
+flask
+flask-cors
+
 # Testing
 pytest

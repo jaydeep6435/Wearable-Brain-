@@ -118,5 +118,45 @@
     "person": null,
     "description": "Medicine after breakfast",
     "recorded_at": "2026-02-25T00:10:19.486151"
+  },
+  {
+    "type": "meeting",
+    "raw_date": "tomorrow",
+    "parsed_date": "2026-02-26",
+    "time": "10 AM",
+    "parsed_time": "10:00",
+    "person": null,
+    "description": "Doctor appointment",
+    "recorded_at": "2026-02-25T00:30:12.344961"
+  },
+  {
+    "type": "task",
+    "raw_date": null,
+    "parsed_date": null,
+    "time": null,
+    "parsed_time": null,
+    "person": null,
+    "description": "Remember to take your medicine after breakfast",
+    "recorded_at": "2026-02-25T00:30:12.344967"
+  },
+  {
+    "type": "medication",
+    "raw_date": null,
+    "parsed_date": null,
+    "time": null,
+    "parsed_time": null,
+    "person": null,
+    "description": "Take your medicine",
+    "recorded_at": "2026-02-25T00:30:12.344969"
+  },
+  {
+    "type": "medication",
+    "raw_date": null,
+    "parsed_date": null,
+    "time": null,
+    "parsed_time": null,
+    "person": null,
+    "description": "Medicine after breakfast",
+    "recorded_at": "2026-02-25T00:30:12.344970"
   }
 ]
