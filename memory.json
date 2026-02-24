@@ -1,0 +1,98 @@
+[
+  {
+    "type": "meeting",
+    "date": "tomorrow",
+    "time": "10 AM",
+    "person": null,
+    "description": "Doctor appointment",
+    "recorded_at": "2026-02-24T23:34:13.298745"
+  },
+  {
+    "type": "meeting",
+    "date": null,
+    "time": null,
+    "person": null,
+    "description": "Clinic",
+    "recorded_at": "2026-02-24T23:34:13.298767"
+  },
+  {
+    "type": "meeting",
+    "date": null,
+    "time": null,
+    "person": null,
+    "description": "Therapist",
+    "recorded_at": "2026-02-24T23:34:13.298768"
+  },
+  {
+    "type": "meeting",
+    "date": null,
+    "time": null,
+    "person": "David",
+    "description": "Visiting this weekend",
+    "recorded_at": "2026-02-24T23:34:13.298770"
+  },
+  {
+    "type": "task",
+    "date": null,
+    "time": null,
+    "person": null,
+    "description": "Don't forget to take your medicine after breakfast",
+    "recorded_at": "2026-02-24T23:34:13.298770"
+  },
+  {
+    "type": "task",
+    "date": null,
+    "time": null,
+    "person": null,
+    "description": "Need to call the pharmacy to refill the prescription before Thursday",
+    "recorded_at": "2026-02-24T23:34:13.298771"
+  },
+  {
+    "type": "task",
+    "date": null,
+    "time": null,
+    "person": null,
+    "description": "Remember to do your morning exercises before lunch",
+    "recorded_at": "2026-02-24T23:34:13.298772"
+  },
+  {
+    "type": "task",
+    "date": "tomorrow",
+    "time": null,
+    "person": null,
+    "description": "Buy groceries tomorrow",
+    "recorded_at": "2026-02-24T23:34:13.298773"
+  },
+  {
+    "type": "task",
+    "date": null,
+    "time": null,
+    "person": null,
+    "description": "Finish your tea",
+    "recorded_at": "2026-02-24T23:34:13.298774"
+  },
+  {
+    "type": "medication",
+    "date": null,
+    "time": null,
+    "person": null,
+    "description": "Take your medicine",
+    "recorded_at": "2026-02-24T23:34:13.298774"
+  },
+  {
+    "type": "medication",
+    "date": null,
+    "time": null,
+    "person": null,
+    "description": "Refill the prescription",
+    "recorded_at": "2026-02-24T23:34:13.298775"
+  },
+  {
+    "type": "medication",
+    "date": null,
+    "time": null,
+    "person": null,
+    "description": "Medicine after breakfast",
+    "recorded_at": "2026-02-24T23:34:13.298776"
+  }
+]

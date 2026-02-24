@@ -106,10 +106,78 @@ def summarize(text: str, num_sentences: int = 3) -> str:
     return " ".join(sent for _, sent, _ in top_n)
 
 
+# -- Importance tagging keywords (for highlighting) -------------------------
+HIGHLIGHT_TAGS = {
+    "date": {"today", "tonight", "tomorrow", "yesterday", "monday", "tuesday",
+             "wednesday", "thursday", "friday", "saturday", "sunday",
+             "january", "february", "march", "april", "may", "june",
+             "july", "august", "september", "october", "november", "december",
+             "next", "this", "coming", "week", "month"},
+    "task": {"call", "buy", "pick", "bring", "send", "submit", "finish",
+             "complete", "prepare", "remind", "remember", "forget", "forgot",
+             "need", "must", "should"},
+    "meeting": {"doctor", "dentist", "therapist", "appointment", "meeting",
+                "visit", "visiting", "clinic", "hospital"},
+    "medication": {"medicine", "medication", "pill", "pills", "tablet",
+                   "prescription", "refill", "dose"},
+}
+
+
+def summarize_with_highlights(text: str, num_sentences: int = 5) -> list[dict]:
+    """
+    Generate a highlighted summary showing which sentences are important.
+
+    Args:
+        text           : The full text to summarize.
+        num_sentences  : How many top sentences to mark as important.
+
+    Returns:
+        List of dicts, one per sentence:
+            "sentence"  : the sentence text
+            "important" : True if this is a top-N sentence
+            "tags"      : list of categories that triggered importance
+                          e.g. ["date", "meeting", "medication"]
+    """
+    sentences = _split_sentences(text)
+    if not sentences:
+        return []
+
+    # Build word-frequency table
+    all_words = re.findall(r'[a-z]+', text.lower())
+    word_freq = Counter(w for w in all_words if w not in STOP_WORDS)
+
+    # Score and rank
+    scored = [(i, sent, _score_sentence(sent, word_freq))
+              for i, sent in enumerate(sentences)]
+    top_indices = {
+        item[0]
+        for item in sorted(scored, key=lambda x: x[2], reverse=True)[:num_sentences]
+    }
+
+    # Build highlighted results
+    results = []
+    for i, sentence in enumerate(sentences):
+        words = set(re.findall(r'[a-z]+', sentence.lower()))
+        tags = []
+        for tag_name, tag_keywords in HIGHLIGHT_TAGS.items():
+            if words & tag_keywords:  # set intersection
+                tags.append(tag_name)
+
+        results.append({
+            "sentence": sentence,
+            "important": i in top_indices,
+            "tags": tags,
+        })
+
+    return results
+
+
 # ---------------------------------------------------------------------------
 # Quick test
 # ---------------------------------------------------------------------------
 if __name__ == "__main__":
+    import json
+
     sample = (
         "Good morning! I have a doctor appointment tomorrow at 10 AM. "
         "Don't forget to take your medicine after breakfast. "
@@ -118,5 +186,14 @@ if __name__ == "__main__":
         "Remember to do your morning exercises before lunch. "
         "The weather today is sunny, perfect for a walk in the garden."
     )
+
     print("--- Summary ---")
     print(summarize(sample, num_sentences=3))
+
+    print("\n--- Highlighted Summary ---")
+    for item in summarize_with_highlights(sample, num_sentences=3):
+        marker = "[IMPORTANT]" if item["important"] else "           "
+        tags = ", ".join(item["tags"]) if item["tags"] else ""
+        print(f"  {marker} {item['sentence']}")
+        if tags:
+            print(f"              Tags: {tags}")
