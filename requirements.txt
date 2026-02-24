@@ -1,0 +1,7 @@
+# Day 1 MVP - Core AI Pipeline
+# Speech-to-Text (offline)
+openai-whisper
+pydub
+
+# Testing
+pytest
