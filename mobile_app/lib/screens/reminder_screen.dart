@@ -1,9 +1,11 @@
-/// Reminder Screen — Shows upcoming reminders and today's schedule
+/// Reminder Screen — Shows upcoming reminders + notification toggle
 ///
 /// Fetches data from GET /reminders and GET /events endpoints.
+/// Allows enabling push notifications that fire even when app is closed.
 
 import 'package:flutter/material.dart';
 import '../services/api_service.dart';
+import '../services/notification_service.dart';
 
 class ReminderScreen extends StatefulWidget {
   const ReminderScreen({super.key});
@@ -19,10 +21,79 @@ class _ReminderScreenState extends State<ReminderScreen> {
   bool _isLoading = true;
   String? _error;
 
+  // Notification state
+  bool _notificationsEnabled = false;
+  int _scheduledCount = 0;
+  bool _syncing = false;
+
   @override
   void initState() {
     super.initState();
+    _loadNotificationState();
     _loadData();
+  }
+
+  Future<void> _loadNotificationState() async {
+    final enabled = await NotificationService.isEnabled();
+    if (mounted) setState(() => _notificationsEnabled = enabled);
+  }
+
+  Future<void> _toggleNotifications(bool enabled) async {
+    setState(() => _syncing = true);
+
+    if (enabled) {
+      // Request permission first
+      final granted = await NotificationService.requestPermission();
+      if (!granted) {
+        if (mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            const SnackBar(content: Text('❌ Notification permission denied')),
+          );
+          setState(() => _syncing = false);
+        }
+        return;
+      }
+
+      // Enable and sync
+      await NotificationService.setEnabled(true);
+      final count = await NotificationService.syncWithBackend();
+      if (mounted) {
+        setState(() {
+          _notificationsEnabled = true;
+          _scheduledCount = count;
+          _syncing = false;
+        });
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('🔔 Notifications ON — $count events scheduled')),
+        );
+      }
+    } else {
+      // Disable and cancel all
+      await NotificationService.setEnabled(false);
+      await NotificationService.cancelAll();
+      if (mounted) {
+        setState(() {
+          _notificationsEnabled = false;
+          _scheduledCount = 0;
+          _syncing = false;
+        });
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('🔕 Notifications OFF')),
+        );
+      }
+    }
+  }
+
+  Future<void> _testNotification() async {
+    await NotificationService.showInstant(
+      title: '🔔 Test Reminder',
+      body: '⏰ This is a test notification from Memory Assistant!',
+    );
+    if (mounted) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('✅ Test notification sent!')),
+      );
+    }
   }
 
   Future<void> _loadData() async {
@@ -32,20 +103,30 @@ class _ReminderScreenState extends State<ReminderScreen> {
     });
 
     try {
-      final reminders = await ApiService.getReminders(minutes: 1440); // 24h
+      final reminders = await ApiService.getUpcoming(minutes: 1440); // 24h
       final events = await ApiService.getEvents();
 
-      setState(() {
-        _upcoming = reminders['upcoming'] ?? [];
-        _todaySchedule = reminders['todays_schedule'] ?? [];
-        _allEvents = events['events'] ?? [];
-        _isLoading = false;
-      });
+      if (mounted) {
+        setState(() {
+          _upcoming = reminders['upcoming'] ?? [];
+          _todaySchedule = reminders['todays_schedule'] ?? [];
+          _allEvents = events['events'] ?? [];
+          _isLoading = false;
+        });
+      }
+
+      // Auto-sync notifications if enabled
+      if (_notificationsEnabled) {
+        final count = await NotificationService.syncWithBackend();
+        if (mounted) setState(() => _scheduledCount = count);
+      }
     } catch (e) {
-      setState(() {
-        _error = e.toString();
-        _isLoading = false;
-      });
+      if (mounted) {
+        setState(() {
+          _error = e.toString();
+          _isLoading = false;
+        });
+      }
     }
   }
 
@@ -88,6 +169,10 @@ class _ReminderScreenState extends State<ReminderScreen> {
                     child: Column(
                       crossAxisAlignment: CrossAxisAlignment.stretch,
                       children: [
+                        // ── Notification Controls ──────────────────
+                        _buildNotificationCard(),
+                        const SizedBox(height: 16),
+
                         // Upcoming reminders
                         _buildSection(
                           '⏰ Upcoming (Next 24h)',
@@ -115,6 +200,99 @@ class _ReminderScreenState extends State<ReminderScreen> {
                     ),
                   ),
                 ),
+    );
+  }
+
+  // ── Notification Toggle Card ────────────────────────────────
+  Widget _buildNotificationCard() {
+    return Card(
+      elevation: 2,
+      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(14)),
+      child: Padding(
+        padding: const EdgeInsets.all(12),
+        child: Column(
+          children: [
+            // Toggle Row
+            Row(
+              children: [
+                Container(
+                  padding: const EdgeInsets.all(8),
+                  decoration: BoxDecoration(
+                    color: _notificationsEnabled
+                        ? Colors.orange.withAlpha(30)
+                        : Colors.grey.withAlpha(20),
+                    borderRadius: BorderRadius.circular(10),
+                  ),
+                  child: Icon(
+                    _notificationsEnabled
+                        ? Icons.notifications_active
+                        : Icons.notifications_off,
+                    color: _notificationsEnabled ? Colors.orange : Colors.grey,
+                    size: 24,
+                  ),
+                ),
+                const SizedBox(width: 12),
+                Expanded(
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Text(
+                        _notificationsEnabled
+                            ? '🔔 Push Notifications ON'
+                            : '🔕 Push Notifications OFF',
+                        style: TextStyle(
+                          fontWeight: FontWeight.bold,
+                          fontSize: 14,
+                          color: _notificationsEnabled ? Colors.orange.shade800 : null,
+                        ),
+                      ),
+                      Text(
+                        _notificationsEnabled
+                            ? '$_scheduledCount events scheduled'
+                            : 'Enable to get reminders when app is closed',
+                        style: const TextStyle(fontSize: 11, color: Colors.grey),
+                      ),
+                    ],
+                  ),
+                ),
+                if (_syncing)
+                  const SizedBox(
+                    width: 24,
+                    height: 24,
+                    child: CircularProgressIndicator(strokeWidth: 2),
+                  )
+                else
+                  Switch(
+                    value: _notificationsEnabled,
+                    onChanged: _toggleNotifications,
+                    activeThumbColor: Colors.orange,
+                  ),
+              ],
+            ),
+
+            // Test button (only shown when enabled)
+            if (_notificationsEnabled) ...[
+              const SizedBox(height: 8),
+              SizedBox(
+                width: double.infinity,
+                height: 36,
+                child: OutlinedButton.icon(
+                  onPressed: _testNotification,
+                  icon: const Icon(Icons.send, size: 16),
+                  label: const Text('Send Test Notification', style: TextStyle(fontSize: 12)),
+                  style: OutlinedButton.styleFrom(
+                    foregroundColor: Colors.orange,
+                    side: BorderSide(color: Colors.orange.withAlpha(100)),
+                    shape: RoundedRectangleBorder(
+                      borderRadius: BorderRadius.circular(8),
+                    ),
+                  ),
+                ),
+              ),
+            ],
+          ],
+        ),
+      ),
     );
   }
 

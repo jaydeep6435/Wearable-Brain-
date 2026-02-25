@@ -9,8 +9,9 @@ import 'package:flutter/material.dart';
 
 class ResultScreen extends StatelessWidget {
   final Map<String, dynamic> data;
+  final bool embedded;
 
-  const ResultScreen({super.key, required this.data});
+  const ResultScreen({super.key, required this.data, this.embedded = false});
 
   @override
   Widget build(BuildContext context) {
@@ -24,27 +25,7 @@ class ResultScreen extends StatelessWidget {
     final tasks = events.where((e) => e['type'] == 'task').toList();
     final medications = events.where((e) => e['type'] == 'medication').toList();
 
-    return Scaffold(
-      appBar: AppBar(
-        title: const Text('Analysis Results'),
-        centerTitle: true,
-        actions: [
-          if (llmUsed)
-            const Padding(
-              padding: EdgeInsets.only(right: 12),
-              child: Chip(
-                label: Text('🤖 AI', style: TextStyle(fontSize: 11)),
-                backgroundColor: Color(0x30673AB7),
-                side: BorderSide.none,
-                padding: EdgeInsets.zero,
-                visualDensity: VisualDensity.compact,
-              ),
-            ),
-        ],
-      ),
-      body: SingleChildScrollView(
-        padding: const EdgeInsets.all(16),
-        child: Column(
+    final content = Column(
           crossAxisAlignment: CrossAxisAlignment.stretch,
           children: [
             // ── Summary Section ──────────────────────────────
@@ -140,7 +121,32 @@ class ResultScreen extends StatelessWidget {
               ),
             ),
           ],
-        ),
+    );
+
+    // If embedded, return just the column (no Scaffold)
+    if (embedded) return content;
+
+    return Scaffold(
+      appBar: AppBar(
+        title: const Text('Analysis Results'),
+        centerTitle: true,
+        actions: [
+          if (llmUsed)
+            const Padding(
+              padding: EdgeInsets.only(right: 12),
+              child: Chip(
+                label: Text('🤖 AI', style: TextStyle(fontSize: 11)),
+                backgroundColor: Color(0x30673AB7),
+                side: BorderSide.none,
+                padding: EdgeInsets.zero,
+                visualDensity: VisualDensity.compact,
+              ),
+            ),
+        ],
+      ),
+      body: SingleChildScrollView(
+        padding: const EdgeInsets.all(16),
+        child: content,
       ),
     );
   }

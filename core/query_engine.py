@@ -15,7 +15,18 @@ No ML models required — fully offline and lightweight.
 """
 
 import re
-from core.memory_manager import MemoryManager
+from typing import Protocol, runtime_checkable
+
+
+# =========================================================================
+# MemoryStore protocol — any object with get_all_events / search_events
+# =========================================================================
+
+@runtime_checkable
+class MemoryStore(Protocol):
+    """Minimal interface for event storage (Repository, adapter, etc.)."""
+    def get_all_events(self) -> list[dict]: ...
+    def search_events(self, keyword: str) -> list[dict]: ...
 
 
 # =========================================================================
@@ -70,7 +81,13 @@ DAY_NAMES = [
 
 class QueryEngine:
     """
-    Rule-based query engine for conversational memory.
+    Hybrid query engine: rule-based + semantic search.
+
+    Priority:
+      1. Intent detection (meeting, task, medication, summary)
+      2. Keyword search (SQL LIKE)
+      3. Semantic search (embedding-based, TF-IDF fallback)
+      4. LLM fallback (if enabled)
 
     Usage:
         engine = QueryEngine(memory_manager)
@@ -78,14 +95,17 @@ class QueryEngine:
         print(answer)
     """
 
-    def __init__(self, memory: MemoryManager):
+    def __init__(self, memory: MemoryStore):
         """
-        Initialize with a MemoryManager instance.
+        Initialize with any object implementing MemoryStore protocol.
 
         Args:
-            memory: A MemoryManager with events already loaded.
+            memory: An object with get_all_events() and search_events() methods.
         """
         self.memory = memory
+        self._searcher = None       # Lazy-loaded TF-IDF SemanticSearch
+        self._emb_searcher = None   # Lazy-loaded EmbeddingSearch
+        self._index_version = 0     # Tracks when to rebuild
 
     # -- Main query method -------------------------------------------------
 
@@ -135,10 +155,13 @@ class QueryEngine:
                     context = self._format_memory_context()
                     llm_answer = answer_query_llm(question, context)
                     if llm_answer:
+                        print(f"[QueryEngine] LLM answered: {llm_answer[:50]}...")
                         return llm_answer
-            except Exception:
+            except Exception as e:
+                print(f"[QueryEngine] LLM error: {e}")
                 pass  # LLM failed — return rule-based result
 
+        print(f"[QueryEngine] {intent} handling returned: {result[:100]}...")
         return result
 
     def _format_memory_context(self) -> str:
@@ -299,7 +322,7 @@ class QueryEngine:
         return f"You have {total} events in memory: {summary}."
 
     def _handle_search_query(self, question: str) -> str:
-        """Fallback: extract keywords and search memory."""
+        """Hybrid search: keyword first, then semantic fallback."""
         # Remove common question words to get meaningful search terms
         stop_words = {
             "what", "when", "where", "who", "how", "is", "are", "was",
@@ -313,7 +336,7 @@ class QueryEngine:
         if not keywords:
             return "I'm not sure what you're looking for. Try asking about meetings, tasks, or medications."
 
-        # Search for each keyword and combine results
+        # Step 1: Keyword search (exact SQL LIKE)
         all_results = []
         seen_descs = set()
 
@@ -325,11 +348,140 @@ class QueryEngine:
                     seen_descs.add(desc.lower())
                     all_results.append(r)
 
-        if not all_results:
-            return f"No events found matching: {', '.join(keywords)}."
+        if all_results:
+            descriptions = self._format_event_list(all_results)
+            return f"Found {len(all_results)} event(s) matching '{' '.join(keywords)}': {descriptions}."
 
-        descriptions = self._format_event_list(all_results)
-        return f"Found {len(all_results)} event(s) matching '{' '.join(keywords)}': {descriptions}."
+        # Step 2: Semantic search (embedding-based, then TF-IDF fallback)
+        semantic_results = self._semantic_search(question)
+        if semantic_results:
+            parts = []
+            for sr in semantic_results:
+                doc = sr["document"]
+                desc = doc.get("description") or doc.get("summary") or doc.get("text", "")
+                score_pct = int(sr["score"] * 100)
+                parts.append(f"{desc} ({score_pct}% match)")
+
+            return f"Found {len(semantic_results)} similar result(s): {'; '.join(parts)}."
+
+        return f"No events found matching: {', '.join(keywords)}."
+
+    # ── Semantic Search ────────────────────────────────────────
+
+    def _get_emb_searcher(self):
+        """Get or create the EmbeddingSearch engine (singleton).
+        Disabled when config.ENABLE_EMBEDDINGS is False."""
+        if self._emb_searcher is None:
+            try:
+                from config import ENABLE_EMBEDDINGS
+            except ImportError:
+                ENABLE_EMBEDDINGS = True
+
+            if not ENABLE_EMBEDDINGS:
+                # Return stub that reports unavailable
+                class _Stub:
+                    is_available = False
+                self._emb_searcher = _Stub()
+            else:
+                from core.semantic_search import EmbeddingSearch
+                self._emb_searcher = EmbeddingSearch()
+        return self._emb_searcher
+
+    def _get_tfidf_searcher(self):
+        """Get or create the TF-IDF search engine, rebuilding index if needed."""
+        from core.semantic_search import SemanticSearch
+
+        # Rebuild index if new events have been added
+        current_events = self.memory.get_all_events()
+        current_count = len(current_events)
+
+        if (self._searcher is None or current_count != self._index_version):
+            self._searcher = SemanticSearch()
+
+            # Build corpus from events + summaries
+            documents = []
+            for event in current_events:
+                documents.append(dict(event))
+
+            # Also index summaries if available
+            if hasattr(self.memory, "search_summaries"):
+                try:
+                    summaries = self.memory.search_summaries()
+                    for s in summaries:
+                        documents.append(dict(s))
+                except Exception:
+                    pass  # Repository may not support this yet
+
+            self._searcher.index(documents)
+            self._index_version = current_count
+
+        return self._searcher
+
+    def _get_documents(self) -> list[dict]:
+        """Build the document corpus from events + summaries."""
+        documents = []
+        current_events = self.memory.get_all_events()
+        for event in current_events:
+            documents.append(dict(event))
+
+        if hasattr(self.memory, "search_summaries"):
+            try:
+                summaries = self.memory.search_summaries()
+                for s in summaries:
+                    documents.append(dict(s))
+            except Exception:
+                pass
+
+        return documents
+
+    def _semantic_search(self, query: str, top_k: int = 5) -> list[dict]:
+        """
+        Perform semantic search.
+
+        Strategy:
+          1. Try EmbeddingSearch (sentence-transformers) — handles synonyms
+          2. Fall back to TF-IDF if embeddings unavailable
+
+        Returns list of {document, score, rank} dicts, or empty list.
+        """
+        try:
+            # Primary: embedding-based search
+            emb = self._get_emb_searcher()
+            if emb.is_available:
+                documents = self._get_documents()
+                if not documents:
+                    return []
+
+                # Load precomputed embeddings if available
+                precomputed = None
+                if hasattr(self.memory, "get_all_conversation_embeddings"):
+                    try:
+                        precomputed = self.memory.get_all_conversation_embeddings()
+                    except Exception:
+                        precomputed = None
+
+                results = emb.search(
+                    query, documents,
+                    top_k=top_k, threshold=0.2,
+                    precomputed_embeddings=precomputed,
+                )
+                if results:
+                    # Apply importance + recency ranking (Phase Q)
+                    from core.memory_ranker import rank_results
+                    return rank_results(results)
+
+            # Fallback: TF-IDF
+            tfidf = self._get_tfidf_searcher()
+            if tfidf.doc_count == 0:
+                return []
+            results = tfidf.search(query, top_k=top_k, threshold=0.1)
+            if results:
+                from core.memory_ranker import rank_results
+                return rank_results(results)
+            return results
+
+        except Exception:
+            return []  # Graceful fallback
 
     # -- Helpers -----------------------------------------------------------
 
@@ -379,9 +531,18 @@ class QueryEngine:
 # Quick test
 # -------------------------------------------------------------------------
 if __name__ == "__main__":
-    # Create a memory manager with sample data
-    memory = MemoryManager()
-    memory.add_events([
+    # Simple in-memory store for testing
+    class _TestStore:
+        def __init__(self, events):
+            self._events = events
+        def get_all_events(self):
+            return self._events
+        def search_events(self, keyword):
+            kw = keyword.lower()
+            return [e for e in self._events
+                    if kw in (e.get('description','') + e.get('type','')).lower()]
+
+    store = _TestStore([
         {"type": "meeting", "date": "tomorrow", "time": "10 AM",
          "person": "Dr. Smith", "description": "Doctor appointment"},
         {"type": "meeting", "date": None, "time": None,
@@ -394,7 +555,7 @@ if __name__ == "__main__":
          "person": None, "description": "Take your medicine after breakfast"},
     ])
 
-    engine = QueryEngine(memory)
+    engine = QueryEngine(store)
 
     test_questions = [
         "What meetings do I have tomorrow?",

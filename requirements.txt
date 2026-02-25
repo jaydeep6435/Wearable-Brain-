@@ -1,17 +1,43 @@
-# Day 1 MVP - Core AI Pipeline
-# Speech-to-Text (offline)
-openai-whisper
-pydub
+# =============================================================
+# Wearable Brain — Memory Assistant for Alzheimer's Patients
+# =============================================================
+# Clean install: pip install -r requirements.txt
+# All dependencies run fully offline after initial download.
 
-# Day 4 - Date parsing
+# ── Core AI Pipeline ─────────────────────────────────────────
+# Speech-to-Text (Whisper, offline, CPU)
+openai-whisper
+
+# Speaker Diarization (pyannote, offline after model download)
+# Requires: huggingface-cli login (one-time for model download)
+pyannote.audio
+
+# PyTorch (required by Whisper + pyannote)
+torch
+torchaudio
+
+# ── Audio Processing ─────────────────────────────────────────
+# Real-time microphone input
+sounddevice
+
+# Numerical arrays for audio buffers
+numpy
+
+# ── NLP & Date Processing ────────────────────────────────────
+# Natural language date parsing ("tomorrow", "next Monday")
 dateparser
 
-# Day 5 - Flask API
-flask
-flask-cors
-
-# Day 7 - Local LLM (Ollama HTTP client)
+# ── Local LLM (optional) ─────────────────────────────────────
+# HTTP client for Ollama local LLM (optional, system works without it)
 requests
 
-# Testing
+# ── Security ─────────────────────────────────────────────────
+# AES-256-GCM database encryption at rest
+cryptography>=41.0
+
+# ── Semantic Search ──────────────────────────────────────────
+# Sentence embeddings for synonym-aware semantic search (offline)
+sentence-transformers>=2.2.0
+
+# ── Testing ───────────────────────────────────────────────────
 pytest
