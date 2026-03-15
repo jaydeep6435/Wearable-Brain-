@@ -170,35 +170,236 @@ def summarize_llm(text: str) -> str | None:
 
 QUERY_PROMPT = """You are a memory assistant for an Alzheimer's patient.
 Answer the question based ONLY on the memory data provided below.
-If the answer is not in the data, say "I don't have that information in memory."
-Keep your answer short and clear.
+Provide a clear, simple answer.
+If the information is not in the data, say "I don't have that information in my memory right now."
+
+Return the response in JSON format with these fields:
+- "answer": your spoken-style answer
+- "confidence": "high", "medium", or "low"
+- "source_count": number of memories used
 
 MEMORY DATA:
 {context}
 
 QUESTION: {question}
 
-ANSWER:"""
+JSON RESPONSE:"""
 
 
-def answer_query_llm(question: str, context: str) -> str | None:
+def answer_query_llm(question: str, context: str) -> dict | None:
     """
     Use LLM to answer a question based on memory context.
-
-    Args:
-        question: The user's natural language question.
-        context: Formatted string of stored events/memories.
-
-    Returns:
-        Answer string, or None if LLM is unavailable.
+    Returns a dict with structured answer.
     """
     prompt = QUERY_PROMPT.format(question=question, context=context)
-    return generate(prompt)
+    response = generate(prompt)
+
+    if not response:
+        return None
+
+    # Try to parse JSON from the response
+    return _parse_json_dict(response)
 
 
 # =========================================================================
-# Internal helpers
+# Event Refinement
 # =========================================================================
+
+EVENT_REFINEMENT_PROMPT = """You are a medical safety auditor for an Alzheimer's assistant.
+I have a conversation transcript and some events my system already extracted.
+Your job is to find MISSED events, especially safety warnings or medical instructions.
+
+TRANSCRIPT:
+{text}
+
+EXTRACTED SO FAR:
+{extracted}
+
+Return ONLY a JSON array of NEW events found (do not repeat existing ones).
+Format each as:
+- "type": "meeting", "task", "medication", or "warning"
+- "description": clear summary
+- "importance": score 1-10 (10 for life safety)
+
+If no new events, return [].
+JSON ARRAY:"""
+
+
+def refine_events_llm(text: str, current_events: list[dict]) -> list[dict]:
+    """
+    Use LLM to find missed events or safety warnings.
+    """
+    events_str = json.dumps(current_events, indent=2)
+    prompt = EVENT_REFINEMENT_PROMPT.format(text=text, extracted=events_str)
+    response = generate(prompt)
+    
+    if not response:
+        return []
+        
+    return _parse_json_array(response) or []
+
+
+# =========================================================================
+# Memory Validation (Hybrid AI — LLM validates rule-based extraction)
+# =========================================================================
+
+VALIDATION_PROMPT = """You are a medical safety auditor for an Alzheimer's patient memory assistant.
+
+I have a conversation transcript and events my rule-based system extracted.
+Your job is to VALIDATE and REFINE these events — NOT to invent new ones.
+
+STRICT RULES:
+- Do NOT invent dates, times, or events not present in the transcript.
+- Do NOT hallucinate people or medications not mentioned.
+- You may CORRECT obvious extraction errors (e.g., wrong date parsing).
+- You may IMPROVE clarity of descriptions and titles.
+- You must CATEGORIZE each event: medical, task, family, safety.
+- You must assign PRIORITY: high, medium, or low.
+- Flag any RISK items (missed medication, safety concern, urgent appointment).
+
+TRANSCRIPT:
+{transcript}
+
+EXTRACTED EVENTS:
+{events}
+
+Return ONLY valid JSON with this exact structure:
+{{
+  "validated_events": [
+    {{
+      "type": "meeting|task|medication|warning",
+      "description": "clear, refined description",
+      "category": "medical|task|family|safety",
+      "priority": "high|medium|low",
+      "raw_date": "date text from transcript or null",
+      "time": "time text from transcript or null",
+      "person": "person name or null",
+      "validated": true
+    }}
+  ],
+  "refined_reminders": [
+    {{
+      "title": "clear reminder title",
+      "category": "medical|task|family|safety",
+      "priority": "high|medium|low",
+      "raw_date": "date from transcript",
+      "time": "time from transcript or null"
+    }}
+  ],
+  "ignored_items": ["reason for any removed events"],
+  "risk_flags": ["any safety concerns or urgent items"],
+  "clean_summary": "A calm, clear 2-3 sentence summary for the patient"
+}}
+
+JSON RESPONSE:"""
+
+
+def validate_memory(
+    transcript: str,
+    extracted_events: list[dict],
+) -> dict | None:
+    """
+    LLM validation layer: validates rule-based extraction results.
+
+    Args:
+        transcript: Original conversation text.
+        extracted_events: Events from rule-based extraction.
+
+    Returns:
+        Dict with validated_events, refined_reminders, ignored_items,
+        risk_flags, and clean_summary. None if LLM unavailable.
+    """
+    events_str = json.dumps(extracted_events, indent=2, default=str)
+    prompt = VALIDATION_PROMPT.format(
+        transcript=transcript,
+        events=events_str,
+    )
+    response = generate(prompt)
+
+    if not response:
+        return None
+
+    result = _parse_json_dict(response)
+    if not result:
+        return None
+
+    # Ensure required keys exist with defaults
+    result.setdefault("validated_events", [])
+    result.setdefault("refined_reminders", [])
+    result.setdefault("ignored_items", [])
+    result.setdefault("risk_flags", [])
+    result.setdefault("clean_summary", "")
+
+    return result
+
+
+# =========================================================================
+# Chat With Memory (LLM-powered conversational memory assistant)
+# =========================================================================
+
+CHAT_MEMORY_PROMPT = """You are a memory assistant for an Alzheimer's patient.
+Your name is "Memory Assistant". You are calm, kind, and helpful.
+
+STRICT RULES:
+- Answer ONLY using the MEMORY CONTEXT provided below.
+- If the information is NOT in the context, say: "I don't have that information in my memory right now, but I can help you check with your family."
+- NEVER make up information, dates, names, or events.
+- Use simple, short sentences. Be warm and reassuring.
+- If the question is about medication, appointments, or safety — emphasize the urgency clearly but calmly.
+- Reference specific memories when answering (e.g., "On Tuesday, your son David mentioned...").
+
+MEMORY CONTEXT:
+{context}
+
+PATIENT'S QUESTION: {question}
+
+Return ONLY valid JSON:
+{{
+  "answer": "Your calm, clear answer here",
+  "related_events": ["brief event reference 1", "brief event reference 2"],
+  "confidence": "high|medium|low"
+}}
+
+JSON RESPONSE:"""
+
+
+def chat_with_memory(question: str, memory_context: str) -> dict | None:
+    """
+    LLM-powered conversational memory Q&A.
+
+    Args:
+        question: Patient's natural language question.
+        memory_context: Formatted string of relevant memories
+                        (ranked by importance + recency + similarity).
+
+    Returns:
+        Dict with answer, related_events, confidence.
+        None if LLM unavailable.
+    """
+    prompt = CHAT_MEMORY_PROMPT.format(
+        question=question,
+        context=memory_context,
+    )
+    response = generate(prompt)
+
+    if not response:
+        return None
+
+    result = _parse_json_dict(response)
+    if result:
+        result.setdefault("answer", "I'm having trouble thinking right now. Please ask again.")
+        result.setdefault("related_events", [])
+        result.setdefault("confidence", "low")
+        return result
+
+    # If JSON parsing failed, use raw text as answer
+    return {
+        "answer": response,
+        "related_events": [],
+        "confidence": "low",
+    }
+
+
 
 def _parse_json_array(text: str) -> list[dict] | None:
     """
@@ -223,6 +424,24 @@ def _parse_json_array(text: str) -> list[dict] | None:
         except json.JSONDecodeError:
             pass
 
+    return None
+
+
+def _parse_json_dict(text: str) -> dict | None:
+    """Try to extract a JSON object from LLM output."""
+    try:
+        # Fast path
+        return json.loads(text)
+    except json.JSONDecodeError:
+        pass
+
+    # Regex path
+    match = re.search(r'\{.*\}', text, re.DOTALL)
+    if match:
+        try:
+            return json.loads(match.group())
+        except json.JSONDecodeError:
+            pass
     return None
 
 

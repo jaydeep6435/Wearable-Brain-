@@ -1,12 +1,21 @@
-/// Home Screen — Text input + Process button + LLM toggle
+/// Record Screen — Simplified Alzheimer-Friendly UI
 ///
-/// User enters conversation text and sends it to the Flask API.
-/// Toggle switch enables AI-powered (LLM) processing via Ollama.
-/// Results (summary + events) are shown on the Results screen.
+/// Two primary modes:
+///   1. Wearable Listening — Start/Stop button, auto-processing
+///   2. Text Input — Simple text area with Send button
+///
+/// States: IDLE → LISTENING → PROCESSING → READY
+///
+/// No developer buttons. No Flask. No technical labels.
+/// Large buttons, calm colors, minimal text.
 
+import 'dart:async';
 import 'package:flutter/material.dart';
+import 'package:shared_preferences/shared_preferences.dart';
 import '../services/api_service.dart';
-import 'result_screen.dart';
+
+/// App states for the record screen
+enum AppState { idle, listening, processing, ready }
 
 class HomeScreen extends StatefulWidget {
   const HomeScreen({super.key});
@@ -15,225 +24,661 @@ class HomeScreen extends StatefulWidget {
   State<HomeScreen> createState() => _HomeScreenState();
 }
 
-class _HomeScreenState extends State<HomeScreen> {
+class _HomeScreenState extends State<HomeScreen>
+    with SingleTickerProviderStateMixin {
+  AppState _state = AppState.idle;
+  String _statusMessage = 'Ready to listen';
+  Map<String, dynamic>? _lastResult;
   final TextEditingController _textController = TextEditingController();
-  bool _isLoading = false;
-  bool _serverOnline = false;
-  bool _useLlm = false;
-  String _llmStatus = 'checking...';
+  bool _showTextMode = false;
+  String _currentSource = 'microphone';
+  String _btDeviceName = '';
+  Map<String, dynamic> _voskStatus = {};
+  Timer? _voskTimer;
+
+  // Pulse animation for listening state
+  late AnimationController _pulseController;
+  late Animation<double> _pulseAnimation;
 
   @override
   void initState() {
     super.initState();
-    _checkServer();
-    _checkLlm();
-    // Pre-fill with sample text for demo
-    _textController.text =
-        'I have a doctor appointment tomorrow at 10 AM. '
-        'Don\'t forget to take your medicine after breakfast. '
-        'We need to call the pharmacy to refill the prescription. '
-        'Your son David is visiting this weekend.';
+    _pulseController = AnimationController(
+      duration: const Duration(milliseconds: 1500),
+      vsync: this,
+    );
+    _pulseAnimation = Tween<double>(begin: 1.0, end: 1.15).animate(
+      CurvedAnimation(parent: _pulseController, curve: Curves.easeInOut),
+    );
+    _loadInitialState();
+    _startStatusTimer();
   }
 
-  Future<void> _checkServer() async {
-    final online = await ApiService.checkServer();
-    setState(() => _serverOnline = online);
-  }
-
-  Future<void> _checkLlm() async {
-    final result = await ApiService.checkLlmStatus();
-    setState(() {
-      _llmStatus = result['status'] ?? 'error';
+  void _startStatusTimer() {
+    // Poll Vosk status every 5 seconds on home screen
+    _voskTimer = Timer.periodic(const Duration(seconds: 5), (timer) async {
+      try {
+        final status = await ApiService.getVoskStatus();
+        if (!mounted) return;
+        setState(() => _voskStatus = status);
+        
+        // If ready, stop fast polling
+        if (status['ready'] == true) {
+          timer.cancel();
+          // Periodically check every 30s just in case
+          _voskTimer = Timer.periodic(const Duration(seconds: 30), (t) async {
+            final s = await ApiService.getVoskStatus();
+            if (!mounted) return;
+            setState(() => _voskStatus = s);
+          });
+        }
+      } catch (_) {}
     });
   }
 
-  Future<void> _processText() async {
-    if (_textController.text.trim().isEmpty) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('Please enter some text')),
-      );
-      return;
-    }
+  Future<void> _loadInitialState() async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      final saved = prefs.getString('audio_source') ?? 'microphone';
+      final info = await ApiService.getAudioSourceInfo();
+      final status = await ApiService.getVoskStatus();
+      if (!mounted) return;
+      setState(() {
+        _currentSource = saved;
+        _btDeviceName = (info['device_name'] ?? '').toString();
+        _voskStatus = status;
+      });
+      // Ensure engine is set to saved source
+      await ApiService.setAudioSource(saved);
+    } catch (_) {}
+  }
 
-    setState(() => _isLoading = true);
+  // ── Start Listening ──────────────────────────────────────
+
+  Future<void> _startListening() async {
+    setState(() {
+      _state = AppState.listening;
+      _statusMessage = 'Listening...';
+      _lastResult = null;
+    });
+    _pulseController.repeat(reverse: true);
 
     try {
-      final result = await ApiService.processText(
-        _textController.text,
-        useLlm: _useLlm,
-      );
-      if (!mounted) return;
-      Navigator.push(
-        context,
-        MaterialPageRoute(
-          builder: (_) => ResultScreen(data: result),
-        ),
-      );
+      await ApiService.startBackgroundListening();
     } catch (e) {
-      if (!mounted) return;
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text('Error: $e')),
-      );
-    } finally {
-      setState(() => _isLoading = false);
+      // Fallback to session recording if background listening unavailable
+      try {
+        await ApiService.startRecording();
+      } catch (_) {}
     }
   }
 
+  // ── Stop Listening ───────────────────────────────────────
+
+  Future<void> _stopListening() async {
+    _pulseController.stop();
+    _pulseController.reset();
+
+    setState(() {
+      _state = AppState.processing;
+      _statusMessage = 'Processing your conversation...';
+    });
+
+    try {
+      // Stop and auto-process
+      final result = await ApiService.stopRecording();
+      if (!mounted) return;
+      setState(() {
+        _state = AppState.ready;
+        _lastResult = result;
+        _statusMessage = 'Done! Memory saved.';
+      });
+
+      // Auto-reset after showing result
+      Future.delayed(const Duration(seconds: 8), () {
+        if (mounted && _state == AppState.ready) {
+          setState(() {
+            _state = AppState.idle;
+            _statusMessage = 'Ready to listen';
+          });
+        }
+      });
+    } catch (e) {
+      if (!mounted) return;
+      setState(() {
+        _state = AppState.idle;
+        _statusMessage = 'Could not process. Try again.';
+      });
+    }
+  }
+
+  // ── Text Mode ────────────────────────────────────────────
+
+  Future<void> _sendText() async {
+    final text = _textController.text.trim();
+    if (text.isEmpty) return;
+
+    setState(() {
+      _state = AppState.processing;
+      _statusMessage = 'Understanding your words...';
+    });
+
+    try {
+      final result = await ApiService.processText(text);
+      if (!mounted) return;
+      _textController.clear();
+      setState(() {
+        _state = AppState.ready;
+        _lastResult = result;
+        _statusMessage = 'Got it! Memory saved.';
+      });
+
+      Future.delayed(const Duration(seconds: 8), () {
+        if (mounted && _state == AppState.ready) {
+          setState(() {
+            _state = AppState.idle;
+            _statusMessage = 'Ready to listen';
+          });
+        }
+      });
+    } catch (e) {
+      if (!mounted) return;
+      setState(() {
+        _state = AppState.idle;
+        _statusMessage = 'Could not understand. Try again.';
+      });
+    }
+  }
+
+  // ── Build ────────────────────────────────────────────────
+
   @override
   Widget build(BuildContext context) {
+    final cs = Theme.of(context).colorScheme;
+
     return Scaffold(
       appBar: AppBar(
-        title: const Text('Memory Assistant'),
+        title: const Text(
+          'Record',
+          style: TextStyle(fontSize: 24, fontWeight: FontWeight.w600),
+        ),
         centerTitle: true,
         actions: [
-          // Server status indicator
-          Padding(
-            padding: const EdgeInsets.only(right: 12),
-            child: Icon(
-              Icons.circle,
-              size: 14,
-              color: _serverOnline ? Colors.greenAccent : Colors.redAccent,
+          // Toggle text mode
+          IconButton(
+            icon: Icon(
+              _showTextMode ? Icons.mic : Icons.keyboard,
+              size: 28,
+            ),
+            tooltip: _showTextMode ? 'Voice mode' : 'Type instead',
+            onPressed: () {
+              setState(() => _showTextMode = !_showTextMode);
+            },
+          ),
+        ],
+      ),
+      body: SafeArea(
+        child: Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 24),
+          child: Column(
+            children: [
+              const Spacer(flex: 1),
+
+              // ── Source Indicator (PART 5) ──
+              _buildSourceIndicator(cs),
+
+              const SizedBox(height: 8),
+
+              // ── Status Message ──
+              Text(
+                _statusMessage,
+                style: TextStyle(
+                  fontSize: 20,
+                  fontWeight: FontWeight.w500,
+                  color: _state == AppState.ready
+                      ? Colors.green.shade700
+                      : cs.onSurface.withValues(alpha: 0.7),
+                ),
+                textAlign: TextAlign.center,
+              ),
+
+              const SizedBox(height: 32),
+
+              // ── Main Action Area ──
+              if (_showTextMode)
+                _buildTextMode(cs)
+              else
+                _buildListeningMode(cs),
+
+              const SizedBox(height: 24),
+
+              // ── Result Preview ──
+              if (_lastResult != null && _state == AppState.ready)
+                _buildResultPreview(cs),
+
+              _buildVoskDownloadProgress(cs),
+
+              const Spacer(flex: 2),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
+  // ── Listening Mode ───────────────────────────────────────
+
+  Widget _buildListeningMode(ColorScheme cs) {
+    switch (_state) {
+      case AppState.idle:
+      case AppState.ready:
+        return _buildStartButton();
+
+      case AppState.listening:
+        return _buildStopButton();
+
+      case AppState.processing:
+        return _buildProcessingIndicator(cs);
+    }
+  }
+
+  Widget _buildStartButton() {
+    return SizedBox(
+      width: 180,
+      height: 180,
+      child: ElevatedButton(
+        onPressed: _startListening,
+        style: ElevatedButton.styleFrom(
+          backgroundColor: const Color(0xFF2E7D32), // Green
+          foregroundColor: Colors.white,
+          shape: const CircleBorder(),
+          elevation: 6,
+          shadowColor: Colors.green.withValues(alpha: 0.4),
+        ),
+        child: const Column(
+          mainAxisAlignment: MainAxisAlignment.center,
+          children: [
+            Icon(Icons.mic, size: 56),
+            SizedBox(height: 8),
+            Text(
+              'Start',
+              style: TextStyle(fontSize: 22, fontWeight: FontWeight.w600),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _buildStopButton() {
+    return ScaleTransition(
+      scale: _pulseAnimation,
+      child: SizedBox(
+        width: 180,
+        height: 180,
+        child: ElevatedButton(
+          onPressed: _stopListening,
+          style: ElevatedButton.styleFrom(
+            backgroundColor: const Color(0xFFC62828), // Red
+            foregroundColor: Colors.white,
+            shape: const CircleBorder(),
+            elevation: 8,
+            shadowColor: Colors.red.withValues(alpha: 0.4),
+          ),
+          child: const Column(
+            mainAxisAlignment: MainAxisAlignment.center,
+            children: [
+              Icon(Icons.stop, size: 56),
+              SizedBox(height: 8),
+              Text(
+                'Stop',
+                style: TextStyle(fontSize: 22, fontWeight: FontWeight.w600),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _buildProcessingIndicator(ColorScheme cs) {
+    return Column(
+      children: [
+        SizedBox(
+          width: 120,
+          height: 120,
+          child: CircularProgressIndicator(
+            strokeWidth: 6,
+            color: cs.primary,
+          ),
+        ),
+        const SizedBox(height: 24),
+        Text(
+          'Processing audio...',
+          style: TextStyle(
+            fontSize: 18,
+            fontWeight: FontWeight.w600,
+            color: cs.onSurface,
+          ),
+        ),
+        const SizedBox(height: 8),
+        Text(
+          '🎙️ Transcribing speech\n🔍 Extracting events\n💾 Saving to memory',
+          textAlign: TextAlign.center,
+          style: TextStyle(
+            fontSize: 14,
+            color: cs.onSurface.withValues(alpha: 0.5),
+            height: 1.6,
+          ),
+        ),
+      ],
+    );
+  }
+
+  // ── Text Mode ────────────────────────────────────────────
+
+  Widget _buildTextMode(ColorScheme cs) {
+    final isProcessing = _state == AppState.processing;
+
+    return Column(
+      children: [
+        TextField(
+          controller: _textController,
+          maxLines: 4,
+          enabled: !isProcessing,
+          style: const TextStyle(fontSize: 17),
+          decoration: InputDecoration(
+            hintText: 'Type what was said...',
+            hintStyle: TextStyle(fontSize: 17, color: cs.outline),
+            border: OutlineInputBorder(
+              borderRadius: BorderRadius.circular(16),
+            ),
+            contentPadding: const EdgeInsets.all(20),
+          ),
+        ),
+        const SizedBox(height: 16),
+        SizedBox(
+          width: double.infinity,
+          height: 56,
+          child: FilledButton.icon(
+            onPressed: isProcessing ? null : _sendText,
+            icon: isProcessing
+                ? const SizedBox(
+                    width: 20,
+                    height: 20,
+                    child: CircularProgressIndicator(
+                      strokeWidth: 2,
+                      color: Colors.white,
+                    ),
+                  )
+                : const Icon(Icons.send, size: 24),
+            label: Text(
+              isProcessing ? 'Understanding...' : 'Save Memory',
+              style: const TextStyle(fontSize: 18),
+            ),
+            style: FilledButton.styleFrom(
+              shape: RoundedRectangleBorder(
+                borderRadius: BorderRadius.circular(16),
+              ),
+            ),
+          ),
+        ),
+      ],
+    );
+  }
+
+  // ── Result Preview ───────────────────────────────────────
+
+  Widget _buildResultPreview(ColorScheme cs) {
+    final summary = _lastResult?['summary'] ?? '';
+    final eventCount = (_lastResult?['events_saved'] ?? 0);
+    final diarizedText = _lastResult?['diarized_text'] ?? '';
+    final fullTranscript = _lastResult?['full_transcript'] ?? '';
+
+    if (summary.toString().isEmpty) return const SizedBox.shrink();
+
+    return Card(
+      elevation: 0,
+      color: Colors.green.withValues(alpha: 0.08),
+      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
+      child: Padding(
+        padding: const EdgeInsets.all(20),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Row(
+              children: [
+                const Icon(Icons.check_circle, color: Colors.green, size: 24),
+                const SizedBox(width: 8),
+                Text(
+                  'Saved!',
+                  style: TextStyle(
+                    fontSize: 18,
+                    fontWeight: FontWeight.w600,
+                    color: Colors.green.shade700,
+                  ),
+                ),
+                const Spacer(),
+                if (eventCount > 0)
+                  Text(
+                    '$eventCount event${eventCount > 1 ? 's' : ''} found',
+                    style: TextStyle(
+                      fontSize: 14,
+                      color: cs.outline,
+                    ),
+                  ),
+              ],
+            ),
+            const SizedBox(height: 12),
+            // ── Show diarized text with speaker labels if available ──
+            if (diarizedText.toString().isNotEmpty)
+              ...[
+                ..._buildDiarizedLines(diarizedText.toString(), cs),
+                if (fullTranscript.toString().trim().isNotEmpty &&
+                    fullTranscript.toString().trim().length > diarizedText.toString().trim().length + 20) ...[
+                  const SizedBox(height: 8),
+                  Text(
+                    fullTranscript.toString(),
+                    style: TextStyle(
+                      fontSize: 14,
+                      height: 1.4,
+                      color: cs.onSurface.withValues(alpha: 0.72),
+                    ),
+                    maxLines: 4,
+                    overflow: TextOverflow.ellipsis,
+                  ),
+                ],
+              ]
+            else
+              Text(
+                summary.toString(),
+                style: TextStyle(
+                  fontSize: 16,
+                  height: 1.5,
+                  color: cs.onSurface.withValues(alpha: 0.8),
+                ),
+                maxLines: 6,
+                overflow: TextOverflow.ellipsis,
+              ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  /// Parse diarized text lines ("Speaker 1: text\nSpeaker 2: text")
+  /// and render with color-coded speaker badges.
+  List<Widget> _buildDiarizedLines(String diarizedText, ColorScheme cs) {
+    final lines = diarizedText.split('\n').where((l) => l.trim().isNotEmpty).toList();
+    final speakerColors = [
+      Colors.blue,
+      Colors.deepOrange,
+      Colors.teal,
+      Colors.purple,
+      Colors.brown,
+    ];
+    final Map<String, int> speakerColorMap = {};
+    int nextColor = 0;
+
+    return lines.take(8).map((line) {
+      final colonIdx = line.indexOf(':');
+      if (colonIdx > 0 && colonIdx < 30) {
+        final speaker = line.substring(0, colonIdx).trim();
+        final text = line.substring(colonIdx + 1).trim();
+
+        // Assign consistent color per speaker
+        if (!speakerColorMap.containsKey(speaker)) {
+          speakerColorMap[speaker] = nextColor++;
+        }
+        final color = speakerColors[speakerColorMap[speaker]! % speakerColors.length];
+
+        return Padding(
+          padding: const EdgeInsets.only(bottom: 8),
+          child: Row(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Container(
+                padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+                decoration: BoxDecoration(
+                  color: color.withValues(alpha: 0.15),
+                  borderRadius: BorderRadius.circular(6),
+                ),
+                child: Text(
+                  speaker,
+                  style: TextStyle(
+                    fontSize: 12,
+                    fontWeight: FontWeight.w700,
+                    color: color,
+                  ),
+                ),
+              ),
+              const SizedBox(width: 8),
+              Expanded(
+                child: Text(
+                  text,
+                  style: TextStyle(
+                    fontSize: 15,
+                    height: 1.4,
+                    color: cs.onSurface.withValues(alpha: 0.85),
+                  ),
+                ),
+              ),
+            ],
+          ),
+        );
+      } else {
+        return Padding(
+          padding: const EdgeInsets.only(bottom: 4),
+          child: Text(
+            line,
+            style: TextStyle(fontSize: 15, color: cs.onSurface.withValues(alpha: 0.8)),
+          ),
+        );
+      }
+    }).toList();
+  }
+
+  // ── Source Indicator ──────────────────────────────────
+
+  Widget _buildSourceIndicator(ColorScheme cs) {
+    final icon = _currentSource == 'bluetooth'
+        ? Icons.bluetooth_audio
+        : _currentSource == 'file'
+            ? Icons.insert_drive_file
+            : Icons.mic;
+    final label = _currentSource == 'bluetooth'
+        ? 'Bluetooth${_btDeviceName.isNotEmpty ? ': $_btDeviceName' : ''}'
+        : _currentSource == 'file'
+            ? 'File Input'
+            : 'Microphone';
+    final color = _currentSource == 'bluetooth'
+        ? Colors.blue
+        : _currentSource == 'file'
+            ? Colors.orange
+            : Colors.green;
+
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+      decoration: BoxDecoration(
+        color: color.withValues(alpha: 0.1),
+        borderRadius: BorderRadius.circular(20),
+        border: Border.all(color: color.withValues(alpha: 0.3)),
+      ),
+      child: Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Icon(icon, size: 18, color: color),
+          const SizedBox(width: 8),
+          Text(
+            'Source: $label',
+            style: TextStyle(
+              fontSize: 14,
+              fontWeight: FontWeight.w600,
+              color: color,
             ),
           ),
         ],
       ),
-      body: Padding(
-        padding: const EdgeInsets.all(16),
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.stretch,
-          children: [
-            // Header
-            const Text(
-              '📝 Enter Conversation Text',
-              style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
-            ),
-            const SizedBox(height: 8),
-            const Text(
-              'Paste or type a conversation. The AI will extract events, '
-              'create a summary, and store it in memory.',
-              style: TextStyle(color: Colors.grey),
-            ),
-            const SizedBox(height: 12),
+    );
+  }
 
-            // 🤖 LLM Toggle
-            Container(
-              padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 4),
-              decoration: BoxDecoration(
-                color: _useLlm
-                    ? Colors.deepPurple.withAlpha(30)
-                    : Theme.of(context).colorScheme.surfaceContainerHighest.withAlpha(80),
-                borderRadius: BorderRadius.circular(12),
-                border: _useLlm
-                    ? Border.all(color: Colors.deepPurple.withAlpha(100))
-                    : null,
-              ),
-              child: Row(
+  Widget _buildVoskDownloadProgress(ColorScheme cs) {
+    if (_voskStatus['ready'] == true || _voskStatus.isEmpty) {
+      return const SizedBox.shrink();
+    }
+
+    final isInitializing = _voskStatus['initializing'] == true;
+    final progress = (_voskStatus['progress'] as int? ?? 0);
+    
+    // Only show if it's actually downloading or has an error
+    if (!isInitializing && progress == 0 && (_voskStatus['error'] ?? '').toString().isEmpty) {
+      return const SizedBox.shrink();
+    }
+
+    return Padding(
+      padding: const EdgeInsets.only(top: 16),
+      child: Card(
+        elevation: 0,
+        color: cs.primaryContainer.withValues(alpha: 0.4),
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
+        child: Padding(
+          padding: const EdgeInsets.all(16),
+          child: Column(
+            children: [
+              Row(
                 children: [
-                  Icon(
-                    _useLlm ? Icons.auto_awesome : Icons.rule,
-                    size: 20,
-                    color: _useLlm ? Colors.deepPurple : Colors.grey,
-                  ),
+                  Icon(Icons.download, color: cs.primary, size: 20),
                   const SizedBox(width: 8),
                   Expanded(
-                    child: Column(
-                      crossAxisAlignment: CrossAxisAlignment.start,
-                      children: [
-                        Text(
-                          _useLlm ? '🤖 AI Mode (LLM)' : '⚡ Fast Mode (Rule-based)',
-                          style: TextStyle(
-                            fontWeight: FontWeight.bold,
-                            fontSize: 13,
-                            color: _useLlm ? Colors.deepPurple : null,
-                          ),
-                        ),
-                        Text(
-                          _useLlm
-                              ? 'Smarter results • Ollama: $_llmStatus'
-                              : 'Quick processing • No LLM needed',
-                          style: const TextStyle(fontSize: 11, color: Colors.grey),
-                        ),
-                      ],
+                    child: Text(
+                      isInitializing 
+                        ? 'Downloading Speech Model: $progress / 130 MB'
+                        : (_voskStatus['error'] ?? '').toString().isNotEmpty
+                            ? 'Model Error: ${_voskStatus['error']}'
+                            : 'Preparing Speech Engine...',
+                      style: TextStyle(
+                        fontSize: 14,
+                        fontWeight: FontWeight.w600,
+                        color: cs.onPrimaryContainer,
+                      ),
                     ),
-                  ),
-                  Switch(
-                    value: _useLlm,
-                    onChanged: (val) {
-                      setState(() => _useLlm = val);
-                      if (val) _checkLlm();
-                    },
-                    activeThumbColor: Colors.deepPurple,
                   ),
                 ],
               ),
-            ),
-
-            // LLM offline warning
-            if (_useLlm && _llmStatus != 'online')
-              Padding(
-                padding: const EdgeInsets.only(top: 4),
-                child: Text(
-                  '⚠️ Ollama is $_llmStatus. Run: ollama serve',
-                  style: const TextStyle(color: Colors.orange, fontSize: 11),
-                  textAlign: TextAlign.center,
-                ),
-              ),
-
-            const SizedBox(height: 12),
-
-            // Text input
-            Expanded(
-              child: TextField(
-                controller: _textController,
-                maxLines: null,
-                expands: true,
-                textAlignVertical: TextAlignVertical.top,
-                decoration: InputDecoration(
-                  hintText: 'Type or paste conversation text here...',
-                  border: OutlineInputBorder(
-                    borderRadius: BorderRadius.circular(12),
-                  ),
-                  filled: true,
-                  fillColor: Theme.of(context).colorScheme.surfaceContainerHighest.withAlpha(80),
-                ),
-              ),
-            ),
-            const SizedBox(height: 16),
-
-            // Process button
-            SizedBox(
-              height: 50,
-              child: ElevatedButton.icon(
-                onPressed: _isLoading ? null : _processText,
-                icon: _isLoading
-                    ? const SizedBox(
-                        width: 20,
-                        height: 20,
-                        child: CircularProgressIndicator(strokeWidth: 2),
-                      )
-                    : Icon(_useLlm ? Icons.auto_awesome : Icons.flash_on),
-                label: Text(_isLoading
-                    ? (_useLlm ? 'AI Processing...' : 'Processing...')
-                    : (_useLlm ? '🤖 Process with AI' : '⚡ Process Text')),
-                style: ElevatedButton.styleFrom(
-                  backgroundColor: _useLlm ? Colors.deepPurple : null,
-                  foregroundColor: _useLlm ? Colors.white : null,
-                  shape: RoundedRectangleBorder(
-                    borderRadius: BorderRadius.circular(12),
+              if (isInitializing && progress > 0) ...[
+                const SizedBox(height: 12),
+                ClipRRect(
+                  borderRadius: BorderRadius.circular(4),
+                  child: LinearProgressIndicator(
+                    value: progress / 13.0,
+                    backgroundColor: cs.primaryContainer,
+                    color: cs.primary,
+                    minHeight: 6,
                   ),
                 ),
-              ),
-            ),
-
-            if (!_serverOnline) ...[
-              const SizedBox(height: 8),
-              const Text(
-                '⚠️ Flask server not reachable. Run: python api.py',
-                style: TextStyle(color: Colors.red, fontSize: 12),
-                textAlign: TextAlign.center,
-              ),
+              ],
             ],
-          ],
+          ),
         ),
       ),
     );
@@ -241,6 +686,7 @@ class _HomeScreenState extends State<HomeScreen> {
 
   @override
   void dispose() {
+    _pulseController.dispose();
     _textController.dispose();
     super.dispose();
   }
