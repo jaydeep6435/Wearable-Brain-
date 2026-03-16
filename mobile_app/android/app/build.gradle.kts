@@ -37,9 +37,9 @@ android {
 
 dependencies {
     coreLibraryDesugaring("com.android.tools:desugar_jdk_libs:2.1.4")
-    // Vosk offline speech recognition (BT fallback)
-    implementation("com.alphacephei:vosk-android:0.3.47")
-    implementation("net.java.dev.jna:jna:5.13.0@aar")
+    // Sherpa-ONNX offline speech recognition
+    implementation("com.github.k2-fsa:sherpa-onnx:v1.12.29")
+    implementation("org.apache.commons:commons-compress:1.27.1")
 }
 
 flutter {

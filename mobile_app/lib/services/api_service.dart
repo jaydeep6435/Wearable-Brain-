@@ -144,6 +144,24 @@ class ApiService {
     }
   }
 
+  /// Compatibility helper expected by ReminderScreen.
+  static Future<Map<String, dynamic>> getReminders({int minutes = 1440}) async {
+    try {
+      final upcomingResult = await getUpcoming(minutes: minutes);
+      final eventsResult = await getEvents();
+
+      final upcoming = (upcomingResult['events'] as List<dynamic>?) ?? <dynamic>[];
+      final todaysSchedule = (eventsResult['events'] as List<dynamic>?) ?? <dynamic>[];
+
+      return {
+        'upcoming': upcoming,
+        'todays_schedule': todaysSchedule,
+      };
+    } catch (e) {
+      throw Exception('Failed to get reminders: $e');
+    }
+  }
+
   // ── Speakers ──────────────────────────────────────────────
 
   /// Get all speaker profiles
@@ -340,9 +358,9 @@ class ApiService {
   // ── Offline ASR & SPK Control ───────────────────────────────────
 
   /// Gets the download/ready status of both models (ASR and SPK)
-  static Future<Map<String, dynamic>> getVoskStatus() async {
+  static Future<Map<String, dynamic>> getSherpaStatus() async {
     try {
-      final result = await _channel.invokeMethod<Map<dynamic, dynamic>>('getVoskStatus');
+      final result = await _channel.invokeMethod<Map<dynamic, dynamic>>('getSherpaStatus');
       final mapped = Map<String, dynamic>.from(result ?? {});
 
       final asr = (mapped['asr'] is Map) ? Map<String, dynamic>.from(mapped['asr']) : <String, dynamic>{};

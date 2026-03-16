@@ -16,6 +16,8 @@ Usage:
 
 import os
 import sys
+import json
+from datetime import datetime
 
 # Ensure project root is on the path so core/ and storage/ imports work
 PROJECT_ROOT = os.path.dirname(os.path.dirname(__file__))
@@ -99,10 +101,13 @@ class MemoryAssistantEngine:
 
         # Query & reminder engines (use adapter + repo for persistence)
         self.query_engine = QueryEngine(self._memory_adapter)
-        self.reminder_mgr = ReminderManager(self._memory_adapter, repo=self.repo)
+        self.reminder_mgr = ReminderManager(self._memory_adapter)
 
         # Auto-schedule reminders for existing events
-        self.reminder_mgr.auto_schedule()
+        try:
+            self.repo.auto_schedule_reminders(lead_minutes=15)
+        except Exception as e:
+            print(f"[Engine] Reminder auto-schedule skipped: {e}")
 
         # Speaker diarization + conversation builder
         self.diarizer = SpeakerDiarizer()
@@ -145,8 +150,15 @@ class MemoryAssistantEngine:
         events = extract_structured_events(text, use_llm=use_llm)
 
         # Step 2b: Score events by importance (Phase Q)
-        from core.memory_ranker import score_events, detect_patterns
-        score_events(events)
+        try:
+            from core.memory_ranker import score_events, detect_patterns
+
+            score_events(events)
+        except Exception as e:
+            print(f"[Engine]   memory_ranker unavailable (text path): {e}")
+
+            def detect_patterns(*args, **kwargs):
+                return None
 
         # Step 2c: LLM Event Refinement (Intelligence Mode)
         try:
@@ -164,7 +176,7 @@ class MemoryAssistantEngine:
         llm_validation = None
         try:
             from core.llm_engine import validate_memory, is_available as llm_available
-            if llm_available():
+            if use_llm and llm_available():
                 print("[Engine]   Step 2d: LLM memory validation...")
                 llm_validation = validate_memory(text, events)
                 if llm_validation:
@@ -238,20 +250,26 @@ class MemoryAssistantEngine:
         print(f"[Engine]   File: {file_path}")
         print(f"[Engine]   DB path: {self.repo.db.db_path}")
 
-        # Step 1: Speaker diarization (who spoke when)
-        print("[Engine]   Step 1/6: Speaker diarization...")
-        dia_segments = self.diarizer.diarize(file_path)
+        # Step 1: Transcribe + diarize
+        print("[Engine]   Step 1/6: Whisper transcription + diarization...")
+        asr_result = transcribe_audio(file_path, enable_diarization=True)
+        text = asr_result["text"]
 
-        # Step 2: Voice fingerprinting (auto-identify returning speakers)
+        # Build diarization segments from ASR speaker-labeled spans.
+        dia_segments = [
+            {
+                "speaker": seg.get("speaker", "Speaker 1"),
+                "start": seg.get("start", 0.0),
+                "end": seg.get("end", 0.0),
+            }
+            for seg in asr_result.get("segments", [])
+        ]
+
+        # Step 2: Voice fingerprinting / label normalization
         print("[Engine]   Step 2/6: Voice fingerprinting...")
         dia_segments = self.identity_mgr.auto_identify_speakers(
             dia_segments, file_path, repo=self.repo,
         )
-
-        # Step 3: Transcribe audio -> text
-        print("[Engine]   Step 3/6: Whisper transcription...")
-        asr_result = transcribe_audio(file_path)
-        text = asr_result["text"]
 
         if not text.strip():
             return {
@@ -264,13 +282,13 @@ class MemoryAssistantEngine:
                 "warning": "No speech detected",
             }
 
-        # Step 4: Build structured conversation (merge diarization + ASR)
-        print("[Engine]   Step 4/6: Building conversation...")
+        # Step 3: Build structured conversation (merge diarization + ASR)
+        print("[Engine]   Step 3/6: Building conversation...")
         conversation = self.conv_builder.build(
             dia_segments, asr_result, identity_manager=self.identity_mgr
         )
         speaker_text = self.conv_builder.build_text(conversation)
-        num_speakers = len(set(s["speaker"] for s in conversation))
+        num_speakers = max(1, len(set(s["speaker"] for s in conversation)))
         print(f"[Engine]   Found {num_speakers} speaker(s), {len(conversation)} segments")
 
         # Step 5: Summarize (use speaker-labeled text for better context)
@@ -283,8 +301,15 @@ class MemoryAssistantEngine:
         events = extract_structured_events(text, use_llm=use_llm)
 
         # Score events by importance (Phase Q)
-        from core.memory_ranker import score_events, detect_patterns
-        score_events(events)
+        try:
+            from core.memory_ranker import score_events, detect_patterns
+
+            score_events(events)
+        except Exception as e:
+            print(f"[Engine]   memory_ranker unavailable (audio path): {e}")
+
+            def detect_patterns(*args, **kwargs):
+                return None
 
         # Step 7: LLM Event Refinement (Intelligence Mode)
         print("[Engine]   Step 7/8: LLM event refinement...")
@@ -303,7 +328,7 @@ class MemoryAssistantEngine:
         llm_validation = None
         try:
             from core.llm_engine import validate_memory, is_available as llm_available
-            if llm_available():
+            if use_llm and llm_available():
                 print("[Engine]   Step 7b: LLM memory validation...")
                 llm_validation = validate_memory(text, events)
                 if llm_validation:
@@ -359,14 +384,23 @@ class MemoryAssistantEngine:
 
     def _finalize_processing_result(self, conv_id: str, raw_text: str, events_saved: int, num_speakers: int = 2) -> dict:
         """Helper to build a unified Intelligence Mode result dict."""
-        conv = self.repo.get_conversation(conv_id)
+        conv = self.repo.get_conversation(conv_id) or {}
+        segments = conv.get("segments", [])
+        speaker_names = list(dict.fromkeys(
+            s.get("speaker", "Speaker 1") for s in segments if s.get("speaker")
+        ))
         summary_obj = conv.get("summary") or {}
         summary_text = summary_obj.get("summary", "No summary generated.")
         key_points = json.loads(summary_obj.get("key_points", "[]"))
 
         # Find urgent and important items
-        from core.memory_ranker import get_urgent_items
-        urgent_items = get_urgent_items(self.repo, hours=48)  # 48h lookahead
+        try:
+            from core.memory_ranker import get_urgent_items
+
+            urgent_items = get_urgent_items(self.repo, hours=48)  # 48h lookahead
+        except Exception as e:
+            print(f"[Engine]   memory_ranker unavailable (finalize path): {e}")
+            urgent_items = []
         
         # High importance items (importance >= 4)
         important_events = [e for e in conv.get("events", []) if e.get("importance_score", 0) >= 4]
@@ -374,10 +408,15 @@ class MemoryAssistantEngine:
         return {
             "status": "ok",
             "conversation_id": conv_id,
+            "transcription": raw_text,
             "transcript_length": len(raw_text),
+            "segments": segments,
+            "speakers": speaker_names,
+            "num_speakers": max(num_speakers, len(speaker_names) or 1),
             "speakers_detected": num_speakers,
             "summary": summary_text,
             "key_points": key_points,
+            "events": conv.get("events", []),
             "events_saved": events_saved,
             "urgent_items": urgent_items[:5],      # Limit for UI
             "important_items": important_events[:5], # Limit for UI
@@ -741,8 +780,13 @@ class MemoryAssistantEngine:
 
         Returns list of event dicts with urgent_flag = True.
         """
-        from core.memory_ranker import get_urgent_items
-        return get_urgent_items(self.repo, hours=hours)
+        try:
+            from core.memory_ranker import get_urgent_items
+
+            return get_urgent_items(self.repo, hours=hours)
+        except Exception as e:
+            print(f"[Engine]   memory_ranker unavailable (urgent path): {e}")
+            return []
 
     def get_memory_patterns(self, min_frequency: int = 1) -> list[dict]:
         """Get recurring conversation patterns."""

@@ -6,6 +6,7 @@ __pycache__/
 # Virtual environments
 venv/
 .env/
+.venv311/
 
 # Whisper model cache
 *.pt

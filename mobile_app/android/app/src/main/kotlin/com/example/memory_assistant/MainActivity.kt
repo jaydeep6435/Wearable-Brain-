@@ -100,14 +100,14 @@ class MainActivity : FlutterActivity() {
         Log.i(TAG, "  SpeechRecognizer available: ${SpeechRecognizer.isRecognitionAvailable(this)}")
         Log.i(TAG, "═══════════════════════════════════════")
 
-        // Initialize Vosk offline ASR (checks if model exists before starting download thread)
-        VoskTranscriber.initAsr(applicationContext) { ready ->
-            Log.i(TAG, "Vosk offline ASR: ${if (ready) "✓ READY" else "✗ NOT AVAILABLE"}")
+        // Initialize sherpa-onnx offline ASR
+        SherpaTranscriber.initAsr(applicationContext) { ready ->
+            Log.i(TAG, "Sherpa offline ASR: ${if (ready) "✓ READY" else "✗ NOT AVAILABLE"}")
         }
 
-        // Initialize Vosk speaker model too (needed for real diarization)
-        VoskTranscriber.initSpk(applicationContext) { ready ->
-            Log.i(TAG, "Vosk speaker model: ${if (ready) "✓ READY" else "✗ NOT AVAILABLE"}")
+        // Initialize speaker subsystem status
+        SherpaTranscriber.initSpk(applicationContext) { ready ->
+            Log.i(TAG, "Speaker subsystem: ${if (ready) "✓ READY" else "✗ NOT AVAILABLE"}")
         }
 
         // Register MethodChannel
@@ -355,7 +355,7 @@ class MainActivity : FlutterActivity() {
                 if (testRec.state == AudioRecord.STATE_INITIALIZED) {
                     recordSampleRate = 8000
                     testRec.release()
-                    Log.i(TAG, "  ★ BT SCO: Using 8kHz (narrowband) — will resample to 16kHz for Vosk")
+                    Log.i(TAG, "  ★ BT SCO: Using 8kHz (narrowband) — will resample to 16kHz for Sherpa")
                 } else {
                     testRec.release()
                     recordSampleRate = SAMPLE_RATE
@@ -370,7 +370,7 @@ class MainActivity : FlutterActivity() {
         }
 
         actualRecordingSampleRate = recordSampleRate
-        Log.i(TAG, "  ★ Recording at: ${recordSampleRate}Hz (target for Vosk: ${SAMPLE_RATE}Hz)")
+        Log.i(TAG, "  ★ Recording at: ${recordSampleRate}Hz (target for Sherpa: ${SAMPLE_RATE}Hz)")
 
         val bufferSize = AudioRecord.getMinBufferSize(
             recordSampleRate,
@@ -492,14 +492,14 @@ class MainActivity : FlutterActivity() {
             Log.i(TAG, "  ★ Resampled: ${data.size / 1024}KB (now ${SAMPLE_RATE}Hz)")
         }
 
-        // ★ AUDIO PREPROCESSING — Dramatically improves Vosk accuracy ★
+        // ★ AUDIO PREPROCESSING — Dramatically improves Sherpa accuracy ★
         data = preprocessAudio(data)
 
         return data
     }
 
     /**
-     * Audio preprocessing pipeline for cleaner Vosk transcription.
+     * Audio preprocessing pipeline for cleaner Sherpa transcription.
      * Steps: DC offset removal → noise gate → gain normalization → high-pass filter.
      */
     private fun preprocessAudio(input: ByteArray): ByteArray {
@@ -935,14 +935,14 @@ class MainActivity : FlutterActivity() {
         Log.i(TAG, "  Name: $name, File: $wavPath")
 
         // Check if required models are loaded
-        if (!VoskTranscriber.isAsrReady()) {
+        if (!SherpaTranscriber.isAsrReady()) {
             Log.w(TAG, "  ✗ ASR model not loaded yet")
             return mapOf(
                 "status" to "error",
                 "message" to "Speech Model not ready. Please download it from Settings first."
             )
         }
-        if (!VoskTranscriber.isSpkReady()) {
+        if (!SherpaTranscriber.isSpkReady()) {
             Log.w(TAG, "  ✗ Speaker model not loaded yet")
             return mapOf(
                 "status" to "error",
@@ -950,7 +950,7 @@ class MainActivity : FlutterActivity() {
             )
         }
 
-        val xvector = VoskTranscriber.extractXVector(wavPath)
+        val xvector = SherpaTranscriber.extractXVector(wavPath)
         if (xvector == null) {
             Log.w(TAG, "  ✗ Could not extract voice fingerprint")
             return mapOf(
@@ -1117,7 +1117,7 @@ class MainActivity : FlutterActivity() {
                 "startRecording", "startBackgroundListening" -> {
                     Log.i(TAG, "━━━ startRecording ━━━━━━━━━━━━━━━━━━")
                     Log.i(TAG, "  Source: $currentAudioSource")
-                    Log.i(TAG, "  Mode: AudioRecord ONLY (post-recording Vosk)")
+                    Log.i(TAG, "  Mode: AudioRecord ONLY (post-recording Sherpa)")
 
                     if (isRecording) {
                         result.success(mapOf("status" to "already_recording"))
@@ -1213,16 +1213,16 @@ class MainActivity : FlutterActivity() {
                         return
                     }
 
-                    // ★ Step 2: Transcribe with Vosk on-device (background thread) ★
+                    // ★ Step 2: Transcribe with sherpa-onnx on-device (background thread) ★
                     val finalWavPath = wavPath
                     val finalDuration = duration
                     val finalSource = if (currentAudioSource == "bluetooth") "bluetooth" else "microphone"
 
-                    if (!VoskTranscriber.isReady()) {
-                        Log.w(TAG, "  ⚠ Vosk model still downloading...")
+                    if (!SherpaTranscriber.isReady()) {
+                        Log.w(TAG, "  ⚠ Speech model still initializing...")
                         result.success(mapOf(
                             "status" to "ok",
-                            "summary" to "Speech model downloading (128MB). Please wait a few minutes and try again.",
+                            "summary" to "Speech model initializing. Please wait and try again.",
                             "events_saved" to 0,
                             "audio_path" to finalWavPath
                         ))
@@ -1230,17 +1230,17 @@ class MainActivity : FlutterActivity() {
                         return
                     }
 
-                    Log.i(TAG, "  ★ Transcribing with Vosk + Speaker ID (post-recording)...")
+                    Log.i(TAG, "  ★ Transcribing with sherpa-onnx (post-recording)...")
 
                     val ctx = this
 
                     Thread {
                         // Use diarized transcription
-                        val segments = VoskTranscriber.transcribeWavWithSpeakers(finalWavPath, ctx)
+                        val segments = SherpaTranscriber.transcribeWavWithSpeakers(finalWavPath, ctx)
 
                         val diarizedTranscript = segments.joinToString(" ") { it["text"].toString() }
                             .replace("\\s+".toRegex(), " ").trim()
-                        val diarizedNormalized = VoskTranscriber.cleanupTranscript(diarizedTranscript).trim()
+                        val diarizedNormalized = SherpaTranscriber.cleanupTranscript(diarizedTranscript).trim()
 
                         fun transcriptQuality(text: String): Double {
                             if (text.isBlank()) return -999.0
@@ -1254,7 +1254,7 @@ class MainActivity : FlutterActivity() {
                         }
 
                         var transcript = diarizedNormalized
-                        var transcriptSource = "vosk_diarized"
+                        var transcriptSource = "sherpa_diarized"
 
                         // Quality fallback: if diarized transcript is too short for duration,
                         // run plain ASR pass and use the cleaner text for processing.
@@ -1262,15 +1262,15 @@ class MainActivity : FlutterActivity() {
                         val diarizedScore = transcriptQuality(diarizedNormalized)
                         if (transcript.length < minExpectedChars || transcript.length < 40 || diarizedScore < 8.0) {
                             Log.w(TAG, "  ⚠ Diarized transcript seems short (${transcript.length} chars for ${"%.1f".format(finalDuration)}s), running plain fallback...")
-                            val plainText = VoskTranscriber.transcribeWav(finalWavPath).trim()
-                            val plainNormalized = VoskTranscriber.cleanupTranscript(plainText).trim()
+                            val plainText = SherpaTranscriber.transcribeWav(finalWavPath).trim()
+                            val plainNormalized = SherpaTranscriber.cleanupTranscript(plainText).trim()
                             val plainScore = transcriptQuality(plainNormalized)
 
                             if (plainNormalized.isNotEmpty() &&
                                 (plainScore > diarizedScore + 1.0 || plainNormalized.length > transcript.length + 15)
                             ) {
                                 transcript = plainNormalized
-                                transcriptSource = "vosk_plain_fallback"
+                                transcriptSource = "sherpa_plain_fallback"
                                 Log.i(TAG, "  ✓ Fallback improved transcript (score ${"%.1f".format(diarizedScore)} → ${"%.1f".format(plainScore)})")
                             }
                         }
@@ -1283,7 +1283,7 @@ class MainActivity : FlutterActivity() {
                                 }
 
                                 if (segments.isNotEmpty()) {
-                                    Log.i(TAG, "  ✓ Vosk diarized: ${segments.size} segments")
+                                    Log.i(TAG, "  ✓ Sherpa diarized: ${segments.size} segments")
                                     segments.forEach { Log.i(TAG, "    [${it["speaker"]}] ${it["text"].toString().take(60)}") }
                                 } else {
                                     Log.w(TAG, "  ⚠ No diarized segments; using plain transcript fallback")
@@ -1303,7 +1303,7 @@ class MainActivity : FlutterActivity() {
                                 enriched["full_transcript"] = transcript
                                 try { result.success(enriched) } catch (_: Exception) {}
                             } else {
-                                Log.w(TAG, "  ⚠ Vosk returned empty")
+                                Log.w(TAG, "  ⚠ Sherpa returned empty")
                                 try {
                                     result.success(mapOf(
                                         "status" to "ok",
@@ -1396,42 +1396,42 @@ class MainActivity : FlutterActivity() {
                     result.success(mapOf("events" to events, "count" to events.size))
                 }
 
-                // ── Vosk Status & Controls ──────────────────────────
-                "getVoskStatus" -> {
-                    result.success(VoskTranscriber.getStatus())
+                // ── Sherpa Status & Controls ──────────────────────────
+                "getSherpaStatus" -> {
+                    result.success(SherpaTranscriber.getStatus())
                 }
                 // ASR Controls
                 "startAsrDownload" -> {
-                    VoskTranscriber.initAsr(this)
+                    SherpaTranscriber.initAsr(this)
                     result.success(true)
                 }
                 "pauseAsrDownload" -> {
-                    VoskTranscriber.pauseAsr()
+                    SherpaTranscriber.pauseAsr()
                     result.success(true)
                 }
                 "resumeAsrDownload" -> {
-                    VoskTranscriber.resumeAsr(this)
+                    SherpaTranscriber.resumeAsr(this)
                     result.success(true)
                 }
                 "retryAsrDownload" -> {
-                    VoskTranscriber.retryAsr(this)
+                    SherpaTranscriber.retryAsr(this)
                     result.success(true)
                 }
                 // SPK Controls
                 "startSpkDownload" -> {
-                    VoskTranscriber.initSpk(this)
+                    SherpaTranscriber.initSpk(this)
                     result.success(true)
                 }
                 "pauseSpkDownload" -> {
-                    VoskTranscriber.pauseSpk()
+                    SherpaTranscriber.pauseSpk()
                     result.success(true)
                 }
                 "resumeSpkDownload" -> {
-                    VoskTranscriber.resumeSpk(this)
+                    SherpaTranscriber.resumeSpk(this)
                     result.success(true)
                 }
                 "retrySpkDownload" -> {
-                    VoskTranscriber.retrySpk(this)
+                    SherpaTranscriber.retrySpk(this)
                     result.success(true)
                 }
 
@@ -1454,7 +1454,7 @@ class MainActivity : FlutterActivity() {
                         return
                     }
 
-                    if (!VoskTranscriber.isReady()) {
+                    if (!SherpaTranscriber.isReady()) {
                         result.success(mapOf("status" to "error", "message" to "Speech model not ready yet"))
                         return
                     }
@@ -1463,10 +1463,10 @@ class MainActivity : FlutterActivity() {
                     Thread {
                         try {
                             // Transcribe the enrollment audio to get x-vectors
-                            val segments = VoskTranscriber.transcribeWavWithSpeakers(audioPath, ctx)
+                            val segments = SherpaTranscriber.transcribeWavWithSpeakers(audioPath, ctx)
                             
                             // Extract the x-vectors from the segments
-                            // We need to get them from Vosk directly
+                            // We need to get them from Sherpa directly
                             val xvectors = mutableListOf<FloatArray>()
                             
                             // Re-process to get raw x-vectors for enrollment

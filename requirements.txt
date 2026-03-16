@@ -1,65 +1,31 @@
-<<<<<<< HEAD
-# Day 1 MVP - Core AI Pipeline
-# Speech-to-Text (offline)
-openai-whisper
+# Wearable Brain - Offline Conversational Memory Assistant
+
+# Core speech pipeline (offline)
+faster-whisper>=1.0.0
+pyannote.audio==3.1.1
+
+# pyannote 3.1.x compatibility pins (Python 3.11)
+torch==2.10.0
+torchaudio==2.10.0
+numpy<2
+huggingface_hub==0.24.6
+
+# Audio capture / processing
+sounddevice
 pydub
 
-# Day 4 - Date parsing
+# NLP and event parsing
 dateparser
 
-# Day 5 - Flask API
+# API and local integration
 flask
 flask-cors
-
-# Day 7 - Local LLM (Ollama HTTP client)
 requests
+
+# Security and semantic memory utilities
+cryptography>=41.0
+# Keep transformers stack compatible with huggingface_hub 0.24.x
+sentence-transformers<5
 
 # Testing
-=======
-# =============================================================
-# Wearable Brain -- Memory Assistant for Alzheimer's Patients
-# =============================================================
-# Clean install: pip install -r requirements.txt
-# All dependencies run fully offline after initial download.
-
-# -- Core AI Pipeline (Speech) --------------------------------
-# faster-whisper: CTranslate2-based Whisper (4x faster on CPU)
-faster-whisper>=1.0.0
-
-# Speaker Diarization (pyannote, offline after model download)
-# Requires: HF_TOKEN for first model download
-pyannote.audio
-
-# Silero VAD: Voice activity detection (via torch.hub, no pip install needed)
-# Loaded automatically from snakers4/silero-vad
-
-# PyTorch (required by faster-whisper + pyannote + Silero VAD)
-torch
-torchaudio
-
-# -- Audio Processing -----------------------------------------
-# Real-time microphone input
-sounddevice
-
-# Numerical arrays for audio buffers
-numpy
-
-# -- NLP & Date Processing ------------------------------------
-# Natural language date parsing ("tomorrow", "next Monday")
-dateparser
-
-# -- Local LLM (optional) -------------------------------------
-# HTTP client for Ollama local LLM (optional, system works without it)
-requests
-
-# -- Security --------------------------------------------------
-# AES-256-GCM database encryption at rest
-cryptography>=41.0
-
-# -- Semantic Search -------------------------------------------
-# Sentence embeddings for synonym-aware semantic search (offline)
-sentence-transformers>=2.2.0
-
-# -- Testing ---------------------------------------------------
->>>>>>> 5ca5d8f (feat: improve mobile transcription and diarization pipeline)
 pytest

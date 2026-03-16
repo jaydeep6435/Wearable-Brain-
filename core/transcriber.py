@@ -1,680 +1,643 @@
 """
-<<<<<<< HEAD
-Transcriber Module — Audio → Text
-==================================
-Uses OpenAI Whisper (offline) to convert an audio file into text.
-Whisper downloads the model on first run (~140 MB for 'base') and
-works fully offline after that.
+Transcriber Module -- Offline ASR + Optional Multi-Speaker Diarization
+========================================================================
+
+Pipeline:
+  Audio -> faster-whisper transcription -> optional pyannote diarization
+        -> speaker assignment (timestamp overlap)
+
+This module keeps backward-compatible APIs used across the project:
+  - transcribe_audio(...)
+  - transcribe_with_speakers(...)
+  - _get_model(...)
+  - detect_speech_segments(...)
 """
 
-import os
-import shutil
-import whisper
-
-
-def transcribe_audio(file_path: str, model_size: str = "base") -> dict:
-=======
-Transcriber Module -- High-Accuracy Speech Pipeline
-=====================================================
-Complete offline speech-to-text pipeline:
-
-  Audio -> Silero VAD (speech detection)
-       -> faster-whisper (transcription with timestamps)
-       -> pyannote (speaker diarization)
-       -> Merge (speaker-labeled transcript)
-
-Stack:
-  - faster-whisper (CTranslate2 backend, 4x faster than OpenAI Whisper)
-  - Silero VAD (speech/silence detection)
-  - pyannote/speaker-diarization (speaker separation)
-
-The model downloads on first use and is cached permanently.
-All models are singletons -- loaded once, reused for all calls.
-
-API is backward-compatible:
-    transcribe_audio(file_path) -> {"text": "...", "segments": [...]}
-"""
+from __future__ import annotations
 
 import os
 import time
 import wave
+from typing import Any
+
 import numpy as np
 
-# =====================================================================
-# Module-level caches (singletons)
-# =====================================================================
+# Singleton caches
 _whisper_model = None
 _whisper_model_size = None
-_vad_model = None
-_vad_utils = None
 
 
-# =====================================================================
-# 1. faster-whisper model loader
-# =====================================================================
+def _load_audio_mono(file_path: str, target_sr: int = 16000):
+    """Load audio into mono float32 numpy array at target_sr."""
+    # Fast path for PCM WAV files (no external codecs required).
+    try:
+        if file_path.lower().endswith(".wav"):
+            with wave.open(file_path, "rb") as wf:
+                sr = wf.getframerate()
+                channels = wf.getnchannels()
+                sampwidth = wf.getsampwidth()
+                raw = wf.readframes(wf.getnframes())
 
-def _get_model(model_size: str = None):
-    """
-    Get or load the faster-whisper model (singleton).
+            if sampwidth == 2:
+                audio = np.frombuffer(raw, dtype=np.int16).astype(np.float32) / 32768.0
+            elif sampwidth == 1:
+                audio = (np.frombuffer(raw, dtype=np.uint8).astype(np.float32) - 128.0) / 128.0
+            elif sampwidth == 4:
+                audio = np.frombuffer(raw, dtype=np.int32).astype(np.float32) / 2147483648.0
+            else:
+                audio = None
 
-    Args:
-        model_size: Model size ('tiny', 'base', 'small', 'medium', 'large-v3').
-                    If None, reads from config.
+            if audio is not None:
+                if channels > 1:
+                    audio = audio.reshape(-1, channels).mean(axis=1)
+                if sr != target_sr and audio.size > 1:
+                    old_x = np.linspace(0.0, 1.0, num=audio.size, endpoint=False)
+                    new_len = max(1, int(audio.size * float(target_sr) / float(sr)))
+                    new_x = np.linspace(0.0, 1.0, num=new_len, endpoint=False)
+                    audio = np.interp(new_x, old_x, audio).astype(np.float32)
+                return audio.astype(np.float32), target_sr
+    except Exception:
+        pass
 
-    Returns:
-        faster_whisper.WhisperModel instance.
-    """
+    try:
+        from pydub import AudioSegment
+
+        seg = AudioSegment.from_file(file_path)
+        seg = seg.set_channels(1).set_frame_rate(target_sr).set_sample_width(2)
+        raw = np.array(seg.get_array_of_samples(), dtype=np.float32)
+        audio = (raw / 32768.0).astype(np.float32)
+        return audio, target_sr
+    except Exception:
+        return None, None
+
+
+def _segment_features(audio: np.ndarray, sr: int, start: float, end: float) -> np.ndarray | None:
+    """Extract compact acoustic features from one time range."""
+    s = max(0, int(start * sr))
+    e = min(audio.size, int(end * sr))
+    if e - s < int(0.20 * sr):
+        return None
+
+    x = audio[s:e]
+    if x.size < 64:
+        return None
+
+    energy = float(np.sqrt(np.mean(np.square(x))) + 1e-8)
+    zc = float(np.mean(np.abs(np.diff(np.signbit(x).astype(np.int8)))))
+
+    nfft = 1
+    while nfft < x.size:
+        nfft *= 2
+    win = np.hanning(x.size).astype(np.float32)
+    spec = np.abs(np.fft.rfft(x * win, n=nfft)).astype(np.float32)
+    if spec.size < 8:
+        return None
+
+    freqs = np.fft.rfftfreq(nfft, d=1.0 / sr).astype(np.float32)
+    spec_sum = float(spec.sum() + 1e-8)
+    centroid = float((freqs * spec).sum() / spec_sum)
+    spread = float(np.sqrt(((freqs - centroid) ** 2 * spec).sum() / spec_sum))
+
+    # Coarse spectral envelope (8 bands)
+    bands = np.array_split(spec, 8)
+    band_energy = np.array([float(b.mean()) if b.size else 0.0 for b in bands], dtype=np.float32)
+    band_energy = band_energy / (band_energy.sum() + 1e-8)
+
+    feat = np.concatenate(
+        [
+            np.array([np.log(energy), zc, centroid / 4000.0, spread / 4000.0], dtype=np.float32),
+            band_energy,
+        ]
+    )
+    return feat
+
+
+def _kmeans2(x: np.ndarray, max_iter: int = 30) -> tuple[np.ndarray, np.ndarray]:
+    """Minimal deterministic 2-means for small feature sets."""
+    if x.shape[0] < 2:
+        return np.zeros(x.shape[0], dtype=np.int32), np.zeros((2, x.shape[1]), dtype=np.float32)
+
+    c0 = x[0].copy()
+    # Pick farthest point from c0 for stable init
+    d = np.sum((x - c0) ** 2, axis=1)
+    c1 = x[int(np.argmax(d))].copy()
+    centers = np.stack([c0, c1], axis=0)
+
+    labels = np.zeros(x.shape[0], dtype=np.int32)
+    for _ in range(max_iter):
+        d0 = np.sum((x - centers[0]) ** 2, axis=1)
+        d1 = np.sum((x - centers[1]) ** 2, axis=1)
+        new_labels = (d1 < d0).astype(np.int32)
+        if np.array_equal(new_labels, labels):
+            break
+        labels = new_labels
+        for k in (0, 1):
+            pts = x[labels == k]
+            if pts.size > 0:
+                centers[k] = pts.mean(axis=0)
+
+    return labels, centers
+
+
+def _heuristic_diarize_from_asr(file_path: str, whisper_segments: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Fallback diarization from ASR timestamps + acoustic clustering."""
+    if len(whisper_segments) < 4:
+        return []
+
+    audio, sr = _load_audio_mono(file_path, target_sr=16000)
+    if audio is None or sr is None:
+        return []
+
+    feats = []
+    seg_idx = []
+    for i, seg in enumerate(whisper_segments):
+        f = _segment_features(audio, sr, float(seg.get("start", 0.0)), float(seg.get("end", 0.0)))
+        if f is not None:
+            feats.append(f)
+            seg_idx.append(i)
+
+    if len(feats) < 4:
+        return []
+
+    x = np.stack(feats).astype(np.float32)
+    # Standardize features
+    mean = x.mean(axis=0, keepdims=True)
+    std = x.std(axis=0, keepdims=True) + 1e-6
+    xz = (x - mean) / std
+
+    labels, centers = _kmeans2(xz)
+
+    # Separation quality gate
+    sep = float(np.linalg.norm(centers[0] - centers[1]))
+    if sep < 1.6:
+        return []
+
+    # Majority balance gate: avoid tiny outlier cluster being treated as speaker
+    n0 = int(np.sum(labels == 0))
+    n1 = int(np.sum(labels == 1))
+    if min(n0, n1) < 2:
+        return []
+
+    raw_segments = []
+    full_labels = [0] * len(whisper_segments)
+    for i, idx in enumerate(seg_idx):
+        full_labels[idx] = int(labels[i])
+
+    for i, seg in enumerate(whisper_segments):
+        label = f"SPEAKER_0{full_labels[i]}"
+        raw_segments.append(
+            {
+                "speaker": label,
+                "start": round(float(seg.get("start", 0.0)), 2),
+                "end": round(float(seg.get("end", 0.0)), 2),
+            }
+        )
+
+    # Merge consecutive same-label spans
+    merged = [raw_segments[0].copy()]
+    for seg in raw_segments[1:]:
+        if seg["speaker"] == merged[-1]["speaker"] and seg["start"] - merged[-1]["end"] <= 1.0:
+            merged[-1]["end"] = seg["end"]
+        else:
+            merged.append(seg.copy())
+
+    speakers = len(set(s["speaker"] for s in merged))
+    return merged if speakers >= 2 else []
+
+
+def _dialogue_turn_diarize(whisper_segments: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Text/turn-taking fallback for short two-person dialog clips."""
+    if len(whisper_segments) < 4:
+        return []
+
+    starts = [float(s.get("start", 0.0)) for s in whisper_segments]
+    ends = [float(s.get("end", 0.0)) for s in whisper_segments]
+    texts = [str(s.get("text", "")).strip().lower() for s in whisper_segments]
+
+    durations = [max(0.0, e - st) for st, e in zip(starts, ends)]
+    pauses = [max(0.0, starts[i] - ends[i - 1]) for i in range(1, len(starts))]
+
+    if np.mean(durations) > 4.0:
+        return []
+    if pauses and float(np.median(pauses)) < 0.6:
+        return []
+
+    has_question = any(t.endswith("?") for t in texts)
+    response_tokens = ("yes", "no", "okay", "ok", "sure", "right", "yeah", "yep")
+    has_response = any(any(t.startswith(tok) for tok in response_tokens) for t in texts)
+    if not (has_question and has_response):
+        return []
+
+    out = []
+    for i, seg in enumerate(whisper_segments):
+        out.append(
+            {
+                "speaker": f"SPEAKER_0{i % 2}",
+                "start": round(float(seg.get("start", 0.0)), 2),
+                "end": round(float(seg.get("end", 0.0)), 2),
+            }
+        )
+
+    return out
+
+
+def _get_model(model_size: str | None = None):
+    """Load and cache faster-whisper model."""
     global _whisper_model, _whisper_model_size
 
     if model_size is None:
         try:
             from config import WHISPER_MODEL_SIZE
+
             model_size = WHISPER_MODEL_SIZE
-        except ImportError:
+        except (ImportError, AttributeError):
             model_size = "base"
 
-    # Return cached model if same size
     if _whisper_model is not None and _whisper_model_size == model_size:
-        print(f"[Transcriber] Reusing cached '{model_size}' model")
         return _whisper_model
 
-    # Determine compute type
     try:
         from config import WHISPER_COMPUTE_TYPE
+
         compute_type = WHISPER_COMPUTE_TYPE
     except (ImportError, AttributeError):
         compute_type = "int8"
 
-    t0 = time.time()
-    print(f"[Transcriber] Loading faster-whisper '{model_size}' (compute={compute_type})...")
-
     from faster_whisper import WhisperModel
 
-    _whisper_model = WhisperModel(
-        model_size,
-        device="cpu",
-        compute_type=compute_type,
-    )
+    t0 = time.time()
+    print(f"[Transcriber] Loading faster-whisper '{model_size}' (compute={compute_type})...")
+    _whisper_model = WhisperModel(model_size, device="cpu", compute_type=compute_type)
     _whisper_model_size = model_size
-    elapsed = time.time() - t0
-    print(f"[Transcriber] Model loaded in {elapsed:.1f}s (cached)")
+    print(f"[Transcriber] Model ready in {time.time() - t0:.1f}s")
 
     return _whisper_model
 
 
-# =====================================================================
-# 2. Audio Loader (bypasses broken torchcodec)
-# =====================================================================
+def _read_wav_info(file_path: str) -> dict[str, Any]:
+    """Read basic WAV metadata used for light validation and fallback timing."""
+    with wave.open(file_path, "rb") as wf:
+        frames = wf.getnframes()
+        rate = wf.getframerate()
+        channels = wf.getnchannels()
+        duration = frames / rate if rate else 0.0
+        return {
+            "frames": frames,
+            "sample_rate": rate,
+            "channels": channels,
+            "duration_sec": float(duration),
+        }
 
-def _load_wav_as_tensor(audio_path: str, target_sr: int = 16000):
->>>>>>> 5ca5d8f (feat: improve mobile transcription and diarization pipeline)
-    """
-    Load a WAV file as a torch tensor using Python's built-in wave module.
-    This bypasses the broken torchaudio/torchcodec audio I/O on Python 3.14.
 
-    Returns:
-        torch.Tensor of shape (1, num_samples) at target_sr, or None on error.
-    """
-    import torch
-
+def _energy_based_speech_regions(file_path: str, frame_ms: int = 200) -> list[tuple[float, float]]:
+    """Fallback speech-region detector when Silero VAD is unavailable."""
     try:
-        with wave.open(audio_path, "rb") as wf:
-            sr = wf.getframerate()
+        with wave.open(file_path, "rb") as wf:
+            rate = wf.getframerate()
             channels = wf.getnchannels()
             sampwidth = wf.getsampwidth()
-            frames = wf.getnframes()
-            raw = wf.readframes(frames)
+            if sampwidth != 2:
+                info = _read_wav_info(file_path)
+                return [(0.0, round(info["duration_sec"], 2))]
+
+            frame_samples = max(1, int(rate * frame_ms / 1000.0))
+
+            rms_values: list[float] = []
+            while True:
+                raw = wf.readframes(frame_samples)
+                if not raw:
+                    break
+                chunk = np.frombuffer(raw, dtype=np.int16).astype(np.float32)
+                if channels > 1:
+                    chunk = chunk.reshape(-1, channels).mean(axis=1)
+                if chunk.size == 0:
+                    rms_values.append(0.0)
+                else:
+                    rms_values.append(float(np.sqrt(np.mean(np.square(chunk)))))
     except Exception:
-        # Not a standard WAV -- try soundfile as fallback
-        try:
-            import soundfile as sf
-            data, sr = sf.read(audio_path, dtype='float32')
-            if data.ndim > 1:
-                data = data.mean(axis=1)
-            waveform = torch.from_numpy(data).unsqueeze(0)
-            if sr != target_sr:
-                waveform = _resample_tensor(waveform, sr, target_sr)
-            return waveform
-        except Exception:
-            pass
-
-        # Last resort: use ffmpeg to convert to raw PCM
-        try:
-            import subprocess
-            import tempfile
-            tmp_path = os.path.join(tempfile.gettempdir(), "_wbrain_tmp.wav")
-            subprocess.run(
-                ["ffmpeg", "-y", "-i", audio_path, "-ar", str(target_sr),
-                 "-ac", "1", "-f", "wav", tmp_path],
-                capture_output=True, timeout=30,
-            )
-            with wave.open(tmp_path, "rb") as wf:
-                sr = wf.getframerate()
-                channels = wf.getnchannels()
-                sampwidth = wf.getsampwidth()
-                frames = wf.getnframes()
-                raw = wf.readframes(frames)
-            os.unlink(tmp_path)
-            audio_np = np.frombuffer(raw, dtype=np.int16).astype(np.float32) / 32768.0
-            if channels > 1:
-                audio_np = audio_np.reshape(-1, channels).mean(axis=1)
-            return torch.from_numpy(audio_np).unsqueeze(0)
-        except Exception as e3:
-            print(f"[Audio] Cannot read {audio_path}: {e3}")
-            return None
-
-    # Convert raw bytes to numpy
-    if sampwidth == 2:
-        audio_np = np.frombuffer(raw, dtype=np.int16).astype(np.float32) / 32768.0
-    elif sampwidth == 4:
-        audio_np = np.frombuffer(raw, dtype=np.int32).astype(np.float32) / 2147483648.0
-    elif sampwidth == 1:
-        audio_np = (np.frombuffer(raw, dtype=np.uint8).astype(np.float32) - 128.0) / 128.0
-    else:
-        print(f"[Audio] Unsupported sample width: {sampwidth}")
         return None
 
-    # Convert stereo to mono
-    if channels > 1:
-        audio_np = audio_np.reshape(-1, channels).mean(axis=1)
+    if not rms_values:
+        return []
 
-    waveform = torch.from_numpy(audio_np).unsqueeze(0)  # (1, samples)
+    threshold = max(200.0, float(np.percentile(rms_values, 60)))
+    regions: list[tuple[float, float]] = []
+    start_idx = None
+    for i, rms in enumerate(rms_values):
+        if rms >= threshold and start_idx is None:
+            start_idx = i
+        elif rms < threshold and start_idx is not None:
+            s = start_idx * frame_ms / 1000.0
+            e = i * frame_ms / 1000.0
+            if e - s >= 0.3:
+                regions.append((round(s, 2), round(e, 2)))
+            start_idx = None
 
-    # Resample if needed
-    if sr != target_sr:
-        waveform = _resample_tensor(waveform, sr, target_sr)
+    if start_idx is not None:
+        s = start_idx * frame_ms / 1000.0
+        e = len(rms_values) * frame_ms / 1000.0
+        if e - s >= 0.3:
+            regions.append((round(s, 2), round(e, 2)))
 
-    return waveform
+    if not regions:
+        info = _read_wav_info(file_path)
+        return [(0.0, round(info["duration_sec"], 2))]
 
+    return regions
 
-def _resample_tensor(waveform, orig_sr: int, target_sr: int):
-    """Simple linear interpolation resampling."""
-    import torch
-    if orig_sr == target_sr:
-        return waveform
-    ratio = target_sr / orig_sr
-    new_length = int(waveform.shape[-1] * ratio)
-    return torch.nn.functional.interpolate(
-        waveform.unsqueeze(0), size=new_length, mode='linear', align_corners=False
-    ).squeeze(0)
-
-
-# =====================================================================
-# 3. Silero VAD -- Voice Activity Detection
-# =====================================================================
 
 def _load_vad():
-    """Load Silero VAD model (singleton)."""
-    global _vad_model, _vad_utils
-    if _vad_model is not None:
-        return _vad_model, _vad_utils
-
+    """Lazy-load Silero VAD if available."""
     try:
         import torch
-        _vad_model, _vad_utils = torch.hub.load(
-            repo_or_dir='snakers4/silero-vad',
-            model='silero_vad',
+
+        model, utils = torch.hub.load(
+            repo_or_dir="snakers4/silero-vad",
+            model="silero_vad",
             force_reload=False,
             onnx=True,
         )
-        print("[VAD] Silero VAD loaded")
-        return _vad_model, _vad_utils
-    except Exception as e:
-        print(f"[VAD] Silero VAD not available: {e}")
+        return model, utils
+    except Exception:
         return None, None
 
 
-def detect_speech_segments(audio_path: str, threshold: float = None):
+def _load_wav_tensor(file_path: str, target_sr: int = 16000):
+    """Load WAV into torch tensor for Silero VAD."""
+    import torch
+
+    with wave.open(file_path, "rb") as wf:
+        sr = wf.getframerate()
+        channels = wf.getnchannels()
+        sampwidth = wf.getsampwidth()
+        frames = wf.readframes(wf.getnframes())
+
+    if sampwidth != 2:
+        return None
+
+    audio = np.frombuffer(frames, dtype=np.int16).astype(np.float32) / 32768.0
+    if channels > 1:
+        audio = audio.reshape(-1, channels).mean(axis=1)
+
+    waveform = torch.from_numpy(audio).unsqueeze(0)
+    if sr == target_sr:
+        return waveform
+
+    resampled = torch.nn.functional.interpolate(
+        waveform.unsqueeze(0),
+        size=int(waveform.shape[-1] * float(target_sr) / float(sr)),
+        mode="linear",
+        align_corners=False,
+    ).squeeze(0)
+    return resampled
+
+
+def detect_speech_segments(audio_path: str, threshold: float | None = None):
     """
-    Use Silero VAD to find speech regions in audio.
-    Uses built-in WAV reader to bypass broken torchcodec.
+    Return list of speech regions as tuples: (start_sec, end_sec).
+
+    Returns None only if file cannot be read.
     """
+    if not os.path.isfile(audio_path):
+        return None
+
     if threshold is None:
         try:
             from config import VAD_THRESHOLD
-            threshold = VAD_THRESHOLD
-        except (ImportError, AttributeError):
+
+            threshold = float(VAD_THRESHOLD)
+        except (ImportError, AttributeError, TypeError, ValueError):
             threshold = 0.5
 
-    vad_model, vad_utils = _load_vad()
-    if vad_model is None:
-        return None
+    model, utils = _load_vad()
+    if model is None or utils is None:
+        return _energy_based_speech_regions(audio_path)
 
     try:
-        (get_speech_timestamps, _, _, _, _) = vad_utils
+        get_speech_timestamps = utils[0]
+        wav = _load_wav_tensor(audio_path, target_sr=16000)
+        if wav is None:
+            return _energy_based_speech_regions(audio_path)
 
-        # Load audio using our own reader (bypasses torchcodec)
-        waveform = _load_wav_as_tensor(audio_path, target_sr=16000)
-        if waveform is None:
-            print("[VAD] Failed to load audio")
-            return None
-
-        # Silero VAD expects 1D tensor
-        wav = waveform.squeeze()
-
-        speech_timestamps = get_speech_timestamps(
-            wav, vad_model,
+        ts = get_speech_timestamps(
+            wav.squeeze(),
+            model,
             threshold=threshold,
             sampling_rate=16000,
             min_speech_duration_ms=250,
             min_silence_duration_ms=300,
             speech_pad_ms=100,
         )
-
-        if not speech_timestamps:
+        if not ts:
             return []
 
-        segments = []
-        for ts in speech_timestamps:
-            segments.append((ts['start'] / 16000.0, ts['end'] / 16000.0))
-
-        total_speech = sum(e - s for s, e in segments)
-        print(f"[VAD] {len(segments)} speech segments, {total_speech:.1f}s total")
-        return segments
-
-    except Exception as e:
-        print(f"[VAD] Error: {e}")
-        import traceback
-        traceback.print_exc()
-        return None
+        return [
+            (round(item["start"] / 16000.0, 2), round(item["end"] / 16000.0, 2))
+            for item in ts
+        ]
+    except Exception:
+        return _energy_based_speech_regions(audio_path)
 
 
-# =====================================================================
-# 3. pyannote Speaker Diarization
-# =====================================================================
+def _assign_speakers(
+    whisper_segments: list[dict[str, Any]], diarization_segments: list[dict[str, Any]]
+) -> list[dict[str, Any]]:
+    """Assign speaker labels to ASR segments via max-overlap alignment."""
+    if not whisper_segments:
+        return []
 
-def diarize_audio(audio_path: str):
-    """
-    Run pyannote speaker diarization.
-
-    Returns:
-        List of {"speaker": "SPEAKER_00", "start": 0.0, "end": 3.5}
-        or None if diarization unavailable.
-    """
-    try:
-        from pyannote.audio import Pipeline as PyannotePipeline
-    except ImportError:
-        print("[Diarize] pyannote.audio not installed")
-        return None
-
-    try:
-        # Get HF token
-        try:
-            from config import HF_TOKEN
-            hf_token = HF_TOKEN
-        except (ImportError, AttributeError):
-            hf_token = os.environ.get("HF_TOKEN", "")
-
-        if not hf_token:
-            print("[Diarize] No HF_TOKEN -- cannot load diarization model")
-            return None
-
-        # Use the community model (no license agreement needed)
-        model_name = "pyannote/speaker-diarization-3.1"
-
-        t0 = time.time()
-        print(f"[Diarize] Loading {model_name}...")
-
-        pipeline = PyannotePipeline.from_pretrained(
-            model_name, token=hf_token
-        )
-
-        import torch
-        pipeline.to(torch.device("cpu"))
-
-        print(f"[Diarize] Model loaded in {time.time() - t0:.1f}s")
-
-        # Pre-load audio as waveform dict (bypasses broken torchcodec)
-        t0 = time.time()
-        waveform = _load_wav_as_tensor(audio_path, target_sr=16000)
-        if waveform is None:
-            print("[Diarize] Failed to load audio")
-            return None
-
-        # pyannote expects {"waveform": tensor, "sample_rate": int}
-        audio_input = {"waveform": waveform, "sample_rate": 16000}
-
-        # Run diarization on pre-loaded waveform
-        diarization = pipeline(audio_input)
-
-        # pyannote 3.1+ returns DiarizeOutput; extract the Annotation
-        if hasattr(diarization, 'speaker_diarization'):
-            annotation = diarization.speaker_diarization
-        else:
-            annotation = diarization  # older pyannote returns Annotation directly
-
-        segments = []
-        for turn, _, speaker in annotation.itertracks(yield_label=True):
-            segments.append({
-                "speaker": speaker,
-                "start": round(turn.start, 2),
-                "end": round(turn.end, 2),
-            })
-
-        # Merge adjacent same-speaker segments
-        segments = _merge_adjacent_segments(segments)
-
-        elapsed = time.time() - t0
-        speakers = set(s["speaker"] for s in segments)
-        print(f"[Diarize] {len(segments)} segments, {len(speakers)} speakers in {elapsed:.1f}s")
-        return segments
-
-    except Exception as e:
-        print(f"[Diarize] Error: {e}")
-        import traceback
-        traceback.print_exc()
-        return None
-
-
-def _merge_adjacent_segments(segments, gap_threshold=1.0):
-    """Merge consecutive segments from same speaker with < gap_threshold gap."""
-    if not segments:
-        return segments
-
-    # Filter very short segments (noise)
-    filtered = [s for s in segments if (s["end"] - s["start"]) >= 0.3]
-    if not filtered:
-        filtered = segments
-
-    merged = [filtered[0].copy()]
-    for seg in filtered[1:]:
-        last = merged[-1]
-        if (seg["speaker"] == last["speaker"]
-                and seg["start"] - last["end"] < gap_threshold):
-            last["end"] = seg["end"]
-        else:
-            merged.append(seg.copy())
-
-    return merged
-
-
-# =====================================================================
-# 4. Segment Merge -- Align Whisper text with diarization speakers
-# =====================================================================
-
-def _assign_speakers(whisper_segments, diarize_segments):
-    """
-    Assign speaker labels to Whisper transcript segments using
-    diarization output. Uses maximum overlap matching.
-
-    Returns list of {"speaker": "Speaker 1", "start": ..., "end": ..., "text": ...}
-    """
-    if not diarize_segments:
+    if not diarization_segments:
         return [
             {
                 "speaker": "Speaker 1",
-                "start": seg.get("start", 0),
-                "end": seg.get("end", 0),
+                "start": round(float(seg.get("start", 0.0)), 2),
+                "end": round(float(seg.get("end", 0.0)), 2),
                 "text": seg.get("text", "").strip(),
             }
             for seg in whisper_segments
             if seg.get("text", "").strip()
         ]
 
-    # Map pyannote speaker IDs to friendly names
-    unique_speakers = list(dict.fromkeys(s["speaker"] for s in diarize_segments))
-    speaker_map = {spk: f"Speaker {i+1}" for i, spk in enumerate(unique_speakers)}
+    speaker_order: list[str] = []
+    for seg in diarization_segments:
+        label = str(seg.get("speaker", "SPEAKER_00"))
+        if label not in speaker_order:
+            speaker_order.append(label)
 
-    result = []
+    if not speaker_order:
+        speaker_order = ["SPEAKER_00"]
+
+    speaker_map = {label: f"Speaker {idx + 1}" for idx, label in enumerate(speaker_order)}
+
+    labeled: list[dict[str, Any]] = []
     for seg in whisper_segments:
         text = seg.get("text", "").strip()
         if not text:
             continue
 
-        seg_start = seg.get("start", 0)
-        seg_end = seg.get("end", 0)
+        start = float(seg.get("start", 0.0))
+        end = float(seg.get("end", start))
+        best_speaker = speaker_order[0]
+        best_overlap = -1.0
 
-        # Find best overlapping diarization segment
-        best_speaker = unique_speakers[0] if unique_speakers else "SPEAKER_00"
-        best_overlap = 0
-
-        for dseg in diarize_segments:
-            overlap_start = max(seg_start, dseg["start"])
-            overlap_end = min(seg_end, dseg["end"])
-            overlap = max(0, overlap_end - overlap_start)
+        for dia in diarization_segments:
+            d_start = float(dia.get("start", 0.0))
+            d_end = float(dia.get("end", 0.0))
+            overlap = max(0.0, min(end, d_end) - max(start, d_start))
             if overlap > best_overlap:
                 best_overlap = overlap
-                best_speaker = dseg["speaker"]
+                best_speaker = str(dia.get("speaker", speaker_order[0]))
 
-        result.append({
-            "speaker": speaker_map.get(best_speaker, "Speaker 1"),
-            "start": round(seg_start, 2),
-            "end": round(seg_end, 2),
-            "text": text,
-        })
+        labeled.append(
+            {
+                "speaker": speaker_map.get(best_speaker, "Speaker 1"),
+                "start": round(start, 2),
+                "end": round(end, 2),
+                "text": text,
+            }
+        )
 
-    # Merge consecutive segments from same speaker
-    if not result:
-        return result
+    if not labeled:
+        return labeled
 
-    merged = [result[0].copy()]
-    for seg in result[1:]:
-        last = merged[-1]
-        if seg["speaker"] == last["speaker"]:
-            last["text"] += " " + seg["text"]
-            last["end"] = seg["end"]
+    merged = [labeled[0].copy()]
+    for seg in labeled[1:]:
+        prev = merged[-1]
+        if seg["speaker"] == prev["speaker"] and seg["start"] - prev["end"] <= 0.8:
+            prev["end"] = seg["end"]
+            prev["text"] = f"{prev['text']} {seg['text']}".strip()
         else:
             merged.append(seg.copy())
 
     return merged
 
 
-# =====================================================================
-# 5. Audio Debug Info
-# =====================================================================
-
-def _read_wav_info(file_path: str) -> dict:
-    """Read WAV file metadata for debugging."""
-    try:
-        with wave.open(file_path, "rb") as wf:
-            frames = wf.getnframes()
-            rate = wf.getframerate()
-            channels = wf.getnchannels()
-            sampwidth = wf.getsampwidth()
-            duration = frames / rate if rate > 0 else 0
-
-            wf.rewind()
-            raw = wf.readframes(frames)
-            audio = np.frombuffer(raw, dtype=np.int16)
-            peak = int(np.max(np.abs(audio))) if audio.size > 0 else 0
-            rms = float(np.sqrt(np.mean(audio.astype(np.float64) ** 2))) if audio.size > 0 else 0
-
-            return {
-                "sample_rate": rate, "channels": channels,
-                "sample_width": sampwidth, "duration_sec": duration,
-                "frames": frames, "peak_amplitude": peak, "rms": rms,
-            }
-    except Exception as e:
-        return {"error": str(e)}
-
-
-# =====================================================================
-# 6. Main Pipeline -- transcribe_audio()
-# =====================================================================
-
-def transcribe_audio(file_path: str, model_size: str = None,
-                     enable_diarization: bool = True) -> dict:
+def transcribe_audio(
+    file_path: str,
+    model_size: str | None = None,
+    enable_diarization: bool = True,
+) -> dict[str, Any]:
     """
-    Full speech pipeline: VAD -> Transcription -> Diarization -> Merge.
-
-    Args:
-<<<<<<< HEAD
-        file_path  : Path to the audio file (wav, mp3, m4a, etc.)
-        model_size : Whisper model size — "tiny", "base", "small", "medium", "large"
-                     Smaller = faster but less accurate. "base" is a good default.
-=======
-        file_path       : Path to audio file (wav, mp3, m4a, etc.)
-        model_size      : Whisper model size override.
-        enable_diarization: Whether to run speaker diarization.
->>>>>>> 5ca5d8f (feat: improve mobile transcription and diarization pipeline)
+    Transcribe audio and optionally return speaker-labeled segments.
 
     Returns:
-        dict with keys:
-            "text"     -- full transcription string
-            "segments" -- list of speaker-labeled segments
-            "speakers" -- list of detected speakers
+      {
+        "text": str,
+        "segments": [{speaker,start,end,text}, ...],
+        "speakers": ["Speaker 1", ...],
+        "vad_segments": [(start,end), ...]
+      }
     """
     if not os.path.isfile(file_path):
         raise FileNotFoundError(f"Audio file not found: '{file_path}'")
 
-    print(f"\n[Pipeline] ========== Speech Pipeline ==========")
-    print(f"[Pipeline]   File: {file_path}")
-    t_start = time.time()
-
-<<<<<<< HEAD
-    # Step 1: Load the Whisper model (downloads once, cached afterwards)
-    print(f"[Transcriber] Loading Whisper '{model_size}' model...")
-    model = whisper.load_model(model_size)
-
-    # Step 2: Run transcription on the audio file
-    print(f"[Transcriber] Transcribing: {file_path}")
-    result = model.transcribe(file_path)
-
-    # Step 3: Return the full text and detailed segments
-    print(f"[Transcriber] Done — {len(result['segments'])} segments found.")
-=======
-    # -- Step 0: Audio quality check --
-    wav_info = _read_wav_info(file_path)
-    if "error" not in wav_info:
-        print(f"[Pipeline]   WAV: {wav_info['sample_rate']}Hz, "
-              f"{wav_info['channels']}ch, "
-              f"{wav_info['duration_sec']:.1f}s, "
-              f"peak={wav_info['peak_amplitude']}, "
-              f"RMS={wav_info['rms']:.0f}")
-        if wav_info['peak_amplitude'] < 100:
-            print(f"[Pipeline]   WARNING: Very low audio level!")
-
-    # -- Step 1: Silero VAD --
-    print(f"[Pipeline]   Step 1/4: Voice Activity Detection...")
-    vad_segments = detect_speech_segments(file_path)
-
-    if vad_segments is not None and len(vad_segments) == 0:
-        print(f"[Pipeline]   No speech detected by VAD")
-        return {"text": "", "segments": [], "speakers": []}
-
-    # -- Step 2: faster-whisper transcription --
-    print(f"[Pipeline]   Step 2/4: Transcription (faster-whisper)...")
+    t0 = time.time()
     model = _get_model(model_size)
 
-    t0 = time.time()
-    segments_iter, info = model.transcribe(
-        file_path,
-        beam_size=5,
-        word_timestamps=True,
-        vad_filter=True,
-        vad_parameters=dict(
-            threshold=0.5,
-            min_speech_duration_ms=250,
-            min_silence_duration_ms=300,
-            speech_pad_ms=100,
-        ),
-        language="en",
-        condition_on_previous_text=True,
+    vad_segments = detect_speech_segments(file_path)
+    if vad_segments == []:
+        print("[Transcriber] VAD found no speech; continuing with ASR fallback pass")
+
+    def _run_asr_pass(vad_filter: bool) -> tuple[list[dict[str, Any]], str]:
+        segments_iter, _info = model.transcribe(
+            file_path,
+            beam_size=5,
+            word_timestamps=True,
+            vad_filter=vad_filter,
+            language="en",
+            condition_on_previous_text=True,
+        )
+
+        segments_local: list[dict[str, Any]] = []
+        text_local: list[str] = []
+        for seg in segments_iter:
+            text = (seg.text or "").strip()
+            if not text:
+                continue
+            segments_local.append(
+                {
+                    "start": float(seg.start),
+                    "end": float(seg.end),
+                    "text": text,
+                }
+            )
+            text_local.append(text)
+
+        return segments_local, " ".join(text_local).strip()
+
+    whisper_segments, full_text = _run_asr_pass(vad_filter=True)
+    if not full_text:
+        print("[Transcriber] First ASR pass empty; retrying without Whisper VAD filter")
+        whisper_segments, full_text = _run_asr_pass(vad_filter=False)
+    if not full_text:
+        return {
+            "text": "",
+            "segments": [],
+            "speakers": [],
+            "vad_segments": vad_segments or [],
+        }
+
+    diarization_segments: list[dict[str, Any]] | None = None
+    if enable_diarization:
+        try:
+            from diarization.diarizer import SpeakerDiarizer
+
+            diarizer = SpeakerDiarizer()
+            diarization_segments = diarizer.diarize(file_path)
+        except Exception as e:
+            print(f"[Transcriber] Diarization skipped: {e}")
+            diarization_segments = None
+
+    # If pyannote/fallback produced one speaker, try ASR-timestamp acoustic clustering.
+    if enable_diarization:
+        speaker_count = len(set(s.get("speaker") for s in (diarization_segments or []) if s.get("speaker")))
+        if speaker_count < 2:
+            heuristic = _heuristic_diarize_from_asr(file_path, whisper_segments)
+            if heuristic:
+                diarization_segments = heuristic
+                print(f"[Transcriber] Heuristic diarization activated: {len(heuristic)} segments, 2 speakers")
+            else:
+                turn_based = _dialogue_turn_diarize(whisper_segments)
+                if turn_based:
+                    diarization_segments = turn_based
+                    print(f"[Transcriber] Turn-taking diarization activated: {len(turn_based)} segments, 2 speakers")
+
+    final_segments = _assign_speakers(whisper_segments, diarization_segments or [])
+    speakers = list(dict.fromkeys(seg["speaker"] for seg in final_segments))
+
+    print(
+        "[Transcriber] Done in "
+        f"{time.time() - t0:.1f}s | text={len(full_text)} chars | "
+        f"segments={len(final_segments)} | speakers={len(speakers)}"
     )
 
-    whisper_segments = []
-    full_text_parts = []
-
-    for segment in segments_iter:
-        seg_dict = {
-            "start": round(segment.start, 2),
-            "end": round(segment.end, 2),
-            "text": segment.text.strip(),
-        }
-        if segment.words:
-            seg_dict["words"] = [
-                {
-                    "word": w.word.strip(),
-                    "start": round(w.start, 2),
-                    "end": round(w.end, 2),
-                    "probability": round(w.probability, 3),
-                }
-                for w in segment.words
-            ]
-        whisper_segments.append(seg_dict)
-        full_text_parts.append(segment.text.strip())
-
-    elapsed_asr = time.time() - t0
-    full_text = " ".join(full_text_parts).strip()
-    print(f"[Pipeline]   Transcribed: {len(whisper_segments)} segments, "
-          f"{len(full_text)} chars in {elapsed_asr:.1f}s")
-    print(f"[Pipeline]   Language: {info.language} (prob={info.language_probability:.2f})")
-
-    if not full_text:
-        print(f"[Pipeline]   No text transcribed")
-        return {"text": "", "segments": [], "speakers": []}
-
-    # -- Step 3: Speaker diarization (pyannote) --
-    diarize_segments = None
-    if enable_diarization:
-        print(f"[Pipeline]   Step 3/4: Speaker Diarization (pyannote)...")
-        diarize_segments = diarize_audio(file_path)
-    else:
-        print(f"[Pipeline]   Step 3/4: Diarization skipped")
-
-    # -- Step 4: Merge transcription + speakers --
-    print(f"[Pipeline]   Step 4/4: Merging segments...")
-    final_segments = _assign_speakers(whisper_segments, diarize_segments)
-
-    speakers = list(dict.fromkeys(s["speaker"] for s in final_segments))
-
-    elapsed_total = time.time() - t_start
-    print(f"[Pipeline]   DONE: {len(final_segments)} segments, "
-          f"{len(speakers)} speakers in {elapsed_total:.1f}s")
-
-    if len(full_text) < 300:
-        print(f"[Pipeline]   Text: '{full_text}'")
-    else:
-        print(f"[Pipeline]   Text: '{full_text[:200]}...'")
-
-    # Print speaker-labeled output
-    for seg in final_segments:
-        print(f"[Pipeline]   [{seg['speaker']}] {seg['text'][:80]}")
-
-    print(f"[Pipeline] ========================================\n")
-
->>>>>>> 5ca5d8f (feat: improve mobile transcription and diarization pipeline)
     return {
         "text": full_text,
         "segments": final_segments,
         "speakers": speakers,
-        "vad_segments": vad_segments,
+        "vad_segments": vad_segments or [],
     }
 
 
-# =====================================================================
-# 7. Convenience: transcribe with speakers (for engine compatibility)
-# =====================================================================
-
-def transcribe_with_speakers(file_path: str, model_size: str = None) -> dict:
-    """
-    Convenience wrapper: always enables diarization.
-    Returns same format as transcribe_audio.
-    """
+def transcribe_with_speakers(file_path: str, model_size: str | None = None) -> dict[str, Any]:
+    """Compatibility wrapper for explicit speaker-aware transcription."""
     return transcribe_audio(file_path, model_size=model_size, enable_diarization=True)
 
 
-# =====================================================================
-# CLI Test
-# =====================================================================
 if __name__ == "__main__":
     import sys
-    import json
 
     if len(sys.argv) < 2:
-        print("Usage: python -m core.transcriber <audio_file> [--no-diarize]")
-        sys.exit(1)
+        print("Usage: python -m core.transcriber <audio_file>")
+        raise SystemExit(1)
 
-    audio_file = sys.argv[1]
-    do_diarize = "--no-diarize" not in sys.argv
-
-    result = transcribe_audio(audio_file, enable_diarization=do_diarize)
-
-    print("\n--- Full Transcription ---")
-    print(result["text"])
-
-    print(f"\n--- {len(result['segments'])} Speaker Segments ---")
-    for seg in result["segments"]:
-        print(f"  [{seg['speaker']}] [{seg['start']:.1f}s-{seg['end']:.1f}s] {seg['text']}")
-
-    print(f"\n--- Speakers: {result['speakers']} ---")
+    output = transcribe_audio(sys.argv[1], enable_diarization=True)
+    print("\n--- Transcript ---")
+    print(output["text"])
+    print("\n--- Segments ---")
+    for item in output["segments"]:
+        print(
+            f"[{item['speaker']}] "
+            f"[{item['start']:.2f}s-{item['end']:.2f}s] "
+            f"{item['text']}"
+        )

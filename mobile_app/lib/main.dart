@@ -12,6 +12,7 @@ import 'package:flutter/material.dart';
 import 'screens/home_screen.dart';
 import 'screens/query_screen.dart';
 import 'screens/reminder_screen.dart';
+import 'screens/settings_screen.dart';
 
 void main() {
   runApp(const MemoryAssistantApp());
@@ -55,6 +56,7 @@ class _MainNavigationState extends State<MainNavigation> {
     HomeScreen(),
     QueryScreen(),
     ReminderScreen(),
+    SettingsScreen(),
   ];
 
   @override
@@ -81,6 +83,11 @@ class _MainNavigationState extends State<MainNavigation> {
             icon: Icon(Icons.notifications_outlined),
             selectedIcon: Icon(Icons.notifications),
             label: 'Reminders',
+          ),
+          NavigationDestination(
+            icon: Icon(Icons.settings_outlined),
+            selectedIcon: Icon(Icons.settings),
+            label: 'Settings',
           ),
         ],
       ),

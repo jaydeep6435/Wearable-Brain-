@@ -33,8 +33,8 @@ class _HomeScreenState extends State<HomeScreen>
   bool _showTextMode = false;
   String _currentSource = 'microphone';
   String _btDeviceName = '';
-  Map<String, dynamic> _voskStatus = {};
-  Timer? _voskTimer;
+  Map<String, dynamic> _sherpaStatus = {};
+  Timer? _sherpaTimer;
 
   // Pulse animation for listening state
   late AnimationController _pulseController;
@@ -55,21 +55,21 @@ class _HomeScreenState extends State<HomeScreen>
   }
 
   void _startStatusTimer() {
-    // Poll Vosk status every 5 seconds on home screen
-    _voskTimer = Timer.periodic(const Duration(seconds: 5), (timer) async {
+    // Poll Sherpa status every 5 seconds on home screen
+    _sherpaTimer = Timer.periodic(const Duration(seconds: 5), (timer) async {
       try {
-        final status = await ApiService.getVoskStatus();
+        final status = await ApiService.getSherpaStatus();
         if (!mounted) return;
-        setState(() => _voskStatus = status);
+        setState(() => _sherpaStatus = status);
         
         // If ready, stop fast polling
         if (status['ready'] == true) {
           timer.cancel();
           // Periodically check every 30s just in case
-          _voskTimer = Timer.periodic(const Duration(seconds: 30), (t) async {
-            final s = await ApiService.getVoskStatus();
+          _sherpaTimer = Timer.periodic(const Duration(seconds: 30), (t) async {
+            final s = await ApiService.getSherpaStatus();
             if (!mounted) return;
-            setState(() => _voskStatus = s);
+            setState(() => _sherpaStatus = s);
           });
         }
       } catch (_) {}
@@ -81,12 +81,12 @@ class _HomeScreenState extends State<HomeScreen>
       final prefs = await SharedPreferences.getInstance();
       final saved = prefs.getString('audio_source') ?? 'microphone';
       final info = await ApiService.getAudioSourceInfo();
-      final status = await ApiService.getVoskStatus();
+      final status = await ApiService.getSherpaStatus();
       if (!mounted) return;
       setState(() {
         _currentSource = saved;
         _btDeviceName = (info['device_name'] ?? '').toString();
-        _voskStatus = status;
+        _sherpaStatus = status;
       });
       // Ensure engine is set to saved source
       await ApiService.setAudioSource(saved);
@@ -256,7 +256,7 @@ class _HomeScreenState extends State<HomeScreen>
               if (_lastResult != null && _state == AppState.ready)
                 _buildResultPreview(cs),
 
-              _buildVoskDownloadProgress(cs),
+              _buildSherpaModelProgress(cs),
 
               const Spacer(flex: 2),
             ],
@@ -622,16 +622,23 @@ class _HomeScreenState extends State<HomeScreen>
     );
   }
 
-  Widget _buildVoskDownloadProgress(ColorScheme cs) {
-    if (_voskStatus['ready'] == true || _voskStatus.isEmpty) {
+  Widget _buildSherpaModelProgress(ColorScheme cs) {
+    final asr = (_sherpaStatus['asr'] is Map)
+        ? Map<String, dynamic>.from(_sherpaStatus['asr'])
+        : <String, dynamic>{};
+
+    if (asr['ready'] == true || _sherpaStatus.isEmpty) {
       return const SizedBox.shrink();
     }
 
-    final isInitializing = _voskStatus['initializing'] == true;
-    final progress = (_voskStatus['progress'] as int? ?? 0);
+    final isInitializing = asr['initializing'] == true;
+    final progress = (asr['progress'] as int? ?? 0);
+    final downloadedMb = (asr['downloaded_mb'] as int? ?? 0);
+    final totalMb = (asr['total_mb'] as int? ?? 0);
+    final errorText = (asr['error'] ?? '').toString();
     
     // Only show if it's actually downloading or has an error
-    if (!isInitializing && progress == 0 && (_voskStatus['error'] ?? '').toString().isEmpty) {
+    if (!isInitializing && progress == 0 && errorText.isEmpty) {
       return const SizedBox.shrink();
     }
 
@@ -652,9 +659,11 @@ class _HomeScreenState extends State<HomeScreen>
                   Expanded(
                     child: Text(
                       isInitializing 
-                        ? 'Downloading Speech Model: $progress / 130 MB'
-                        : (_voskStatus['error'] ?? '').toString().isNotEmpty
-                            ? 'Model Error: ${_voskStatus['error']}'
+                        ? (totalMb > 0
+                          ? 'Downloading Speech Model: $downloadedMb / $totalMb MB'
+                          : 'Downloading Speech Model: $progress%')
+                        : errorText.isNotEmpty
+                          ? 'Model Error: $errorText'
                             : 'Preparing Speech Engine...',
                       style: TextStyle(
                         fontSize: 14,
@@ -670,7 +679,7 @@ class _HomeScreenState extends State<HomeScreen>
                 ClipRRect(
                   borderRadius: BorderRadius.circular(4),
                   child: LinearProgressIndicator(
-                    value: progress / 13.0,
+                    value: (progress.clamp(0, 100)) / 100.0,
                     backgroundColor: cs.primaryContainer,
                     color: cs.primary,
                     minHeight: 6,

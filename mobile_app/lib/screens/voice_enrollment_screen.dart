@@ -1,7 +1,7 @@
 /// Voice Enrollment Screen — Record your voice to create a voice profile
 ///
 /// Flow: Enter name → Read 3 sentences aloud (25s total) → Save voiceprint
-/// The recorded audio is processed by VoskTranscriber to extract
+/// The recorded audio is processed by SherpaTranscriber to extract
 /// a 128-dimensional x-vector "voice fingerprint".
 ///
 /// Multiple sentences ensure the model captures a wide range of phonemes,
@@ -87,16 +87,16 @@ class _VoiceEnrollmentScreenState extends State<VoiceEnrollmentScreen>
 
     // Check if both models are ready before recording
     try {
-      final voskStatus = await ApiService.getVoskStatus();
-      final asr = (voskStatus['asr'] is Map)
-          ? Map<String, dynamic>.from(voskStatus['asr'])
+      final sherpaStatus = await ApiService.getSherpaStatus();
+      final asr = (sherpaStatus['asr'] is Map)
+          ? Map<String, dynamic>.from(sherpaStatus['asr'])
           : <String, dynamic>{};
-      final spk = (voskStatus['spk'] is Map)
-          ? Map<String, dynamic>.from(voskStatus['spk'])
+      final spk = (sherpaStatus['spk'] is Map)
+          ? Map<String, dynamic>.from(sherpaStatus['spk'])
           : <String, dynamic>{};
 
-      final asrReady = (voskStatus['asrReady'] == true) || (asr['ready'] == true);
-      final spkReady = (voskStatus['spkReady'] == true) || (spk['ready'] == true);
+      final asrReady = (sherpaStatus['asrReady'] == true) || (asr['ready'] == true);
+      final spkReady = (sherpaStatus['spkReady'] == true) || (spk['ready'] == true);
       
       if (!asrReady) {
         setState(() {

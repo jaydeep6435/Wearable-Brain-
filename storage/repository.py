@@ -704,6 +704,14 @@ class Repository:
             (phrase,),
         )
 
+    def save_pattern(self, phrase: str, category: str = "general") -> int:
+        """Compatibility alias used by engine-side pattern detection."""
+        return self.increment_pattern(phrase=phrase, category=category)
+
+    def get_memory_stats(self) -> dict:
+        """Compatibility alias for debug endpoints."""
+        return self.get_stats()
+
     def get_urgent_events(self, hours: int = 24) -> list[dict]:
         """
         Get medication and meeting events that may be urgent.

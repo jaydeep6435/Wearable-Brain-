@@ -10,7 +10,7 @@ import java.util.UUID
 import kotlin.math.sqrt
 
 /**
- * SpeakerEngine — Offline speaker identification using Vosk x-vectors.
+ * SpeakerEngine — Offline speaker identification using 128-D voice embeddings.
  *
  * Each voice has a unique 128-dimensional x-vector "fingerprint".
  * We store enrolled voices in SQLite and compare new speech segments

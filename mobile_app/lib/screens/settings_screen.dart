@@ -28,8 +28,8 @@ class _SettingsScreenState extends State<SettingsScreen> {
   Map<String, dynamic> _resourceStats = {};
   List<dynamic> _speakers = [];
   Map<String, dynamic> _audioSource = {};
-  Map<String, dynamic> _voskStatus = {};
-  Timer? _voskTimer;
+  Map<String, dynamic> _sherpaStatus = {};
+  Timer? _sherpaTimer;
   bool _loading = true;
 
   // Audio source selection
@@ -46,18 +46,18 @@ class _SettingsScreenState extends State<SettingsScreen> {
 
   @override
   void dispose() {
-    _voskTimer?.cancel();
+    _sherpaTimer?.cancel();
     super.dispose();
   }
 
   void _startStatusTimer() {
-    // Poll Vosk status every 2 seconds while settings are open
-    _voskTimer = Timer.periodic(const Duration(seconds: 2), (timer) async {
+    // Poll Sherpa status every 2 seconds while settings are open
+    _sherpaTimer = Timer.periodic(const Duration(seconds: 2), (timer) async {
       try {
-        final status = await ApiService.getVoskStatus();
+        final status = await ApiService.getSherpaStatus();
         if (!mounted) return;
         setState(() {
-          _voskStatus = status;
+          _sherpaStatus = status;
         });
         
         // If ready, slow down polling or stop
@@ -70,12 +70,12 @@ class _SettingsScreenState extends State<SettingsScreen> {
   }
 
   void _startSlowTimer() {
-    _voskTimer = Timer.periodic(const Duration(seconds: 10), (timer) async {
+    _sherpaTimer = Timer.periodic(const Duration(seconds: 10), (timer) async {
       try {
-        final status = await ApiService.getVoskStatus();
+        final status = await ApiService.getSherpaStatus();
         if (!mounted) return;
         setState(() {
-          _voskStatus = status;
+          _sherpaStatus = status;
         });
       } catch (_) {}
     });
@@ -122,13 +122,13 @@ class _SettingsScreenState extends State<SettingsScreen> {
       setState(() => _loading = false);
     }
 
-    // Load Vosk status separately so it never blocks the main settings
+    // Load Sherpa status separately so it never blocks the main settings
     try {
-      final vosk = await ApiService.getVoskStatus();
+      final sherpa = await ApiService.getSherpaStatus();
       if (!mounted) return;
-      setState(() => _voskStatus = vosk);
+      setState(() => _sherpaStatus = sherpa);
     } catch (_) {
-      // Vosk status will be loaded by the periodic timer
+      // Sherpa status will be loaded by the periodic timer
     }
   }
 
@@ -374,7 +374,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
                           title: 'High-Accuracy Speech Model',
                           description: 'Required for offline transcription',
                           icon: Icons.psychology,
-                          status: _voskStatus['asr'] ?? {},
+                          status: _sherpaStatus['asr'] ?? {},
                           defaultSize: 130,
                           onStart: ApiService.startAsrDownload,
                           onPause: ApiService.pauseAsrDownload,
@@ -392,7 +392,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
                           title: 'Speaker Identification Model',
                           description: 'Identifies WHO is speaking',
                           icon: Icons.record_voice_over,
-                          status: _voskStatus['spk'] ?? {},
+                          status: _sherpaStatus['spk'] ?? {},
                           defaultSize: 12,
                           onStart: ApiService.startSpkDownload,
                           onPause: ApiService.pauseSpkDownload,
