@@ -289,7 +289,7 @@ def llm_status():
             "ollama_url": OLLAMA_URL,
             "default_model": DEFAULT_MODEL,
             "available_models": models,
-            "instructions": None if available else "Install Ollama from https://ollama.com then run: ollama pull phi3",
+            "instructions": None if available else "Install Ollama from https://ollama.com then run: ollama pull qwen2.5:3b-instruct",
         })
     except Exception as e:
         return jsonify({

@@ -16,8 +16,8 @@ import java.util.UUID
  *
  * Tables: conversations, events, summaries
  */
-class MemoryDatabase(context: Context) : SQLiteOpenHelper(
-    context, "memory.db", null, DB_VERSION
+class MemoryDatabase(private val appContext: Context) : SQLiteOpenHelper(
+    appContext, "memory.db", null, DB_VERSION
 ) {
     companion object {
         const val TAG = "WBrain.DB"
@@ -102,8 +102,15 @@ class MemoryDatabase(context: Context) : SQLiteOpenHelper(
         convId: String, type: String, description: String,
         date: String? = null, time: String? = null, person: String? = null
     ): String? {
+        val effectiveDate = date?.trim().takeUnless { it.isNullOrBlank() }
+            ?: extractDateHint(description)
+        val effectiveTime = time?.trim().takeUnless { it.isNullOrBlank() }
+            ?: extractTimeHint(description)
+        val effectivePerson = person?.trim().takeUnless { it.isNullOrBlank() }
+            ?: extractPersonHint(description)
+
         // Deduplicate by fingerprint
-        val fp = "$type|${description.lowercase().trim()}|${date ?: ""}|${time ?: ""}"
+        val fp = "$type|${description.lowercase().trim()}|${effectiveDate ?: ""}|${effectiveTime ?: ""}|${effectivePerson ?: ""}"
             .hashCode().toString(16)
 
         val existing = readableDatabase.rawQuery(
@@ -122,9 +129,9 @@ class MemoryDatabase(context: Context) : SQLiteOpenHelper(
             put("conversation_id", convId)
             put("type", type)
             put("description", description)
-            put("raw_date", date)
-            put("raw_time", time)
-            put("person", person)
+            put("raw_date", effectiveDate)
+            put("raw_time", effectiveTime)
+            put("person", effectivePerson)
             put("fingerprint", fp)
         }
         writableDatabase.insertWithOnConflict(
@@ -151,66 +158,133 @@ class MemoryDatabase(context: Context) : SQLiteOpenHelper(
     // ── Legacy Query (used by queryMemory MethodChannel) ─────
 
     fun queryMemory(question: String): Map<String, Any> {
-        val lower = question.lowercase()
         Log.i(TAG, "⤷ queryMemory: '$question'")
 
+        if (question.isBlank()) {
+            return mapOf(
+                "answer" to "Please ask a specific question about your memory.",
+                "results" to emptyList<Map<String, Any>>(),
+                "method" to "intent"
+            )
+        }
+
+        // Use the intent-aware engine so answers stay concise and question-focused.
+        val chat = chatWithMemory(question)
+        val conciseAnswer = (chat["answer"] as? String)?.trim().orEmpty()
+
+        // Provide structured evidence list for UI/debug without dumping full transcript text.
+        val related = collectRelatedMemory(question, limit = 6)
+
+        return mapOf(
+            "answer" to conciseAnswer,
+            "results" to related,
+            "method" to "intent",
+            "confidence" to (chat["confidence"] ?: "medium"),
+            "mode" to (chat["mode"] ?: "local")
+        )
+    }
+
+    private fun collectRelatedMemory(question: String, limit: Int = 6): List<Map<String, Any?>> {
         val stopWords = setOf(
             "what", "when", "where", "who", "how", "is", "are", "was", "were",
             "do", "did", "does", "the", "a", "an", "i", "my", "me", "have",
             "has", "had", "about", "for", "any", "tell", "show", "find",
-            "can", "you", "please", "know"
+            "can", "you", "please", "know", "memory", "remember"
         )
-        val keywords = lower.split(Regex("[\\s,;.!?]+"))
+        val keywords = question.lowercase()
+            .split(Regex("[\\s,;.!?]+"))
             .filter { it.length > 2 && it !in stopWords }
 
-        if (keywords.isEmpty()) {
-            return mapOf(
-                "answer" to "Please ask a more specific question.",
-                "results" to emptyList<Map<String, Any>>(),
-                "method" to "keyword"
-            )
-        }
+        if (keywords.isEmpty()) return emptyList()
 
-        val results = mutableListOf<Map<String, String?>>()
+        val rows = mutableListOf<Map<String, Any?>>()
         val seen = mutableSetOf<String>()
 
         for (kw in keywords) {
-            val cursor = readableDatabase.rawQuery(
-                """SELECT * FROM events
+            // Event hits
+            val ev = readableDatabase.rawQuery(
+                """SELECT type, description, raw_date, raw_time, person
+                   FROM events
                    WHERE description LIKE ? OR type LIKE ? OR person LIKE ?
-                   ORDER BY rowid DESC LIMIT 20""",
+                   ORDER BY rowid DESC LIMIT 10""",
                 arrayOf("%$kw%", "%$kw%", "%$kw%")
             )
-            while (cursor.moveToNext()) {
-                val desc = cursor.getString(cursor.getColumnIndexOrThrow("description")) ?: ""
-                if (desc.lowercase() !in seen) {
-                    seen.add(desc.lowercase())
-                    results.add(mapOf(
-                        "type" to cursor.getString(cursor.getColumnIndexOrThrow("type")),
-                        "description" to desc,
-                        "raw_date" to cursor.getString(cursor.getColumnIndexOrThrow("raw_date")),
-                        "raw_time" to cursor.getString(cursor.getColumnIndexOrThrow("raw_time")),
-                        "person" to cursor.getString(cursor.getColumnIndexOrThrow("person"))
-                    ))
+            while (ev.moveToNext()) {
+                val desc = ev.getString(1) ?: ""
+                val key = "e:${cleanDesc(desc).lowercase()}"
+                if (desc.isNotBlank() && key !in seen) {
+                    seen.add(key)
+                    rows.add(
+                        mapOf(
+                            "source" to "event",
+                            "type" to (ev.getString(0) ?: ""),
+                            "description" to desc,
+                            "raw_date" to ev.getString(2),
+                            "raw_time" to ev.getString(3),
+                            "person" to ev.getString(4)
+                        )
+                    )
                 }
             }
-            cursor.close()
-        }
+            ev.close()
 
-        val answer = if (results.isEmpty()) {
-            "No memories found matching: ${keywords.joinToString(", ")}."
-        } else {
-            val parts = results.take(5).map { r ->
-                val desc = r["description"] ?: "Unknown"
-                val time = r["raw_time"]?.let { " at $it" } ?: ""
-                val person = r["person"]?.let { " (with $it)" } ?: ""
-                "• $desc$time$person"
+            // Summary hits
+            val sm = readableDatabase.rawQuery(
+                """SELECT summary
+                   FROM summaries
+                   WHERE summary LIKE ?
+                   ORDER BY created_at DESC LIMIT 5""",
+                arrayOf("%$kw%")
+            )
+            while (sm.moveToNext()) {
+                val summary = sm.getString(0) ?: ""
+                val key = "s:${summary.take(80).lowercase()}"
+                if (summary.isNotBlank() && key !in seen) {
+                    seen.add(key)
+                    rows.add(
+                        mapOf(
+                            "source" to "summary",
+                            "description" to cleanDesc(summary)
+                        )
+                    )
+                }
             }
-            "Found ${results.size} memory/memories:\n${parts.joinToString("\n")}"
+            sm.close()
+
+            // Conversation raw text hits (snippet only)
+            val cv = readableDatabase.rawQuery(
+                """SELECT raw_text, timestamp
+                   FROM conversations
+                   WHERE raw_text LIKE ?
+                   ORDER BY rowid DESC LIMIT 5""",
+                arrayOf("%$kw%")
+            )
+            while (cv.moveToNext()) {
+                val raw = cv.getString(0) ?: ""
+                val key = "c:${raw.take(80).lowercase()}"
+                if (raw.isNotBlank() && key !in seen) {
+                    seen.add(key)
+                    val firstSentence = raw
+                        .split(Regex("[.!?\\n]+"))
+                        .map { it.trim() }
+                        .firstOrNull { it.isNotBlank() }
+                        ?.take(160)
+                        ?: raw.take(160)
+                    rows.add(
+                        mapOf(
+                            "source" to "conversation",
+                            "description" to firstSentence,
+                            "timestamp" to cv.getString(1)
+                        )
+                    )
+                }
+            }
+            cv.close()
+
+            if (rows.size >= limit) break
         }
 
-        Log.i(TAG, "  → ${results.size} results found")
-        return mapOf("answer" to answer, "results" to results, "method" to "keyword")
+        return rows.take(limit)
     }
 
     // ── Stats ────────────────────────────────────────────────
@@ -368,6 +442,10 @@ class MemoryDatabase(context: Context) : SQLiteOpenHelper(
         val apPat = listOf("appointment","meeting","doctor","visit","schedule","when is my","clinic","hospital","checkup")
         if (apPat.any { lower.contains(it) }) return "APPOINTMENT"
 
+        // Specific time question (prefer direct answer over long lists)
+        val timePat = listOf("what time", "when does", "when is it", "start time", "at what time")
+        if (timePat.any { lower.contains(it) }) return "TIME_QUERY"
+
         // Medication
         val medPat = listOf("medicine","medication","pill","tablet","prescription","pharmacy","refill")
         if (medPat.any { lower.contains(it) }) return "MEDICATION"
@@ -386,10 +464,82 @@ class MemoryDatabase(context: Context) : SQLiteOpenHelper(
         "COUNT_EVENTS"       -> intentCountEvents()
         "EVENTS_ON_DATE"     -> intentEventsOnDate(question)
         "DAILY_SUMMARY"      -> intentDailySummary()
+        "TIME_QUERY"         -> intentTimeQuery(question)
         "APPOINTMENT"        -> intentListAppointments()
         "MEDICATION"         -> intentListMedications()
         "REMINDER"           -> intentListReminders()
         else                 -> intentGeneralQuery(question)
+    }
+
+    // ── TIME_QUERY ────────────────────────────────────────
+
+    private fun intentTimeQuery(question: String): StructuredResult {
+        val q = question.lowercase()
+        val stopWords = setOf(
+            "what", "when", "time", "does", "is", "it", "start", "at", "the", "a", "an",
+            "my", "me", "to", "for", "of", "on", "in", "about", "please"
+        )
+        val kws = q.split(Regex("[\\s,;.!?]+"))
+            .filter { it.length > 2 && it !in stopWords }
+
+        val items = mutableListOf<Map<String, String>>()
+
+        fun collectRows(cursor: android.database.Cursor) {
+            while (cursor.moveToNext()) {
+                val desc = cursor.getString(0) ?: ""
+                val date = cursor.getString(1) ?: ""
+                val time = cursor.getString(2) ?: ""
+                val person = cursor.getString(3) ?: ""
+                if (time.isNotBlank()) {
+                    items.add(
+                        mapOf(
+                            "description" to desc,
+                            "date" to date,
+                            "time" to time,
+                            "person" to person,
+                        )
+                    )
+                }
+            }
+        }
+
+        for (kw in kws) {
+            val cur = readableDatabase.rawQuery(
+                """SELECT description, raw_date, raw_time, person
+                   FROM events
+                   WHERE raw_time IS NOT NULL AND trim(raw_time) != ''
+                   AND (description LIKE ? OR type LIKE ? OR person LIKE ?)
+                   ORDER BY rowid DESC LIMIT 5""",
+                arrayOf("%$kw%", "%$kw%", "%$kw%")
+            )
+            collectRows(cur)
+            cur.close()
+            if (items.isNotEmpty()) break
+        }
+
+        if (items.isEmpty()) {
+            val cur = readableDatabase.rawQuery(
+                """SELECT description, raw_date, raw_time, person
+                   FROM events
+                   WHERE raw_time IS NOT NULL AND trim(raw_time) != ''
+                   AND type IN ('meeting','appointment','task','note')
+                   ORDER BY rowid DESC LIMIT 1""",
+                null
+            )
+            collectRows(cur)
+            cur.close()
+        }
+
+        val top = items.firstOrNull()
+        val answer = if (top == null) {
+            "I couldn't find a specific time in your saved memories yet."
+        } else {
+            val time = top["time"].orEmpty()
+            val desc = cleanDesc(top["description"].orEmpty())
+            if (desc.isNotBlank()) "It is at $time for: $desc." else "It is at $time."
+        }
+
+        return StructuredResult(answer, items, if (top != null) "high" else "low")
     }
 
     // ── COUNT_APPOINTMENTS ──────────────────────────────────
@@ -572,8 +722,12 @@ class MemoryDatabase(context: Context) : SQLiteOpenHelper(
         } catch (_: Exception) {}
 
         val unique = items.distinctBy { cleanDesc(it["description"]?:"").take(40) }
-        val answer = if (unique.isEmpty()) "I couldn't find anything about that. Try asking about appointments, medications, or people by name."
-        else "Here's what I found:\n\n${formatItemList(unique)}"
+        val answer = if (unique.isEmpty()) {
+            "I couldn't find anything specific about that yet."
+        } else {
+            val top = cleanDesc(unique.first()["description"].orEmpty())
+            if (top.isBlank()) "I found related memory details." else top
+        }
         return StructuredResult(answer, items, if (items.isNotEmpty()) "high" else "low")
     }
 
@@ -632,73 +786,154 @@ class MemoryDatabase(context: Context) : SQLiteOpenHelper(
         return text.take(120).trim()
     }
 
+    private fun extractTimeHint(text: String): String? {
+        if (text.isBlank()) return null
+        val m = Regex("\\b\\d{1,2}(?::\\d{2})?\\s?(?:AM|PM|am|pm)\\b").find(text)
+        return m?.value?.trim()
+    }
+
+    private fun extractDateHint(text: String): String? {
+        if (text.isBlank()) return null
+        val rel = Regex("\\b(today|tomorrow|yesterday|this weekend|next week|monday|tuesday|wednesday|thursday|friday|saturday|sunday)\\b", RegexOption.IGNORE_CASE)
+            .find(text)
+            ?.value
+            ?.trim()
+        if (!rel.isNullOrBlank()) return rel
+
+        val abs = Regex("\\b(?:jan|january|feb|february|mar|march|apr|april|may|jun|june|jul|july|aug|august|sep|sept|september|oct|october|nov|november|dec|december)\\s+\\d{1,2}(?:,\\s*\\d{4})?\\b", RegexOption.IGNORE_CASE)
+            .find(text)
+            ?.value
+            ?.trim()
+        return abs
+    }
+
+    private fun extractPersonHint(text: String): String? {
+        if (text.isBlank()) return null
+
+        // Prefer explicit doctor-name patterns first.
+        val dr = Regex("\\bDr\\.?\\s+[A-Z][a-z]+\\b").find(text)?.value?.trim()
+        if (!dr.isNullOrBlank()) return dr
+
+        // Safer generic person cue patterns.
+        val cue = Regex("\\b(?:with|from|for|by)\\s+([A-Z][a-z]{2,}(?:\\s+[A-Z][a-z]{2,})?)\\b").find(text)
+        return cue?.groupValues?.getOrNull(1)?.trim()
+    }
+
+    private fun detectAnswerStyle(question: String): String {
+        val q = question.lowercase()
+        return when {
+            q.contains("json") -> "json"
+            q.contains("bullet") || q.contains("points") || q.contains("list") -> "bullet"
+            q.contains("numbered") || q.contains("steps") -> "numbered"
+            q.startsWith("is ") || q.startsWith("are ") || q.startsWith("do ") || q.startsWith("does ") ||
+                q.startsWith("did ") || q.startsWith("can ") || q.startsWith("was ") || q.startsWith("were ") ||
+                q.startsWith("have ") || q.startsWith("has ") -> "yes_no"
+            q.contains("short") || q.contains("brief") || q.contains("one line") -> "brief"
+            else -> "direct"
+        }
+    }
+
+    private fun styleInstruction(style: String): String {
+        return when (style) {
+            "json" -> "Return valid compact JSON only: {\"answer\":\"...\",\"confidence\":\"high|medium|low\"}."
+            "bullet" -> "Return 2 to 5 bullet points using '- ' prefix."
+            "numbered" -> "Return 2 to 5 numbered lines (1., 2., 3.)."
+            "yes_no" -> "Start with 'Yes' or 'No' when possible, then one short clarification sentence."
+            "brief" -> "Return one short sentence only."
+            else -> "Return 1 to 3 short direct sentences."
+        }
+    }
+
+    private fun applyStyleFallback(answer: String, style: String, confidence: String): String {
+        val clean = answer
+            .replace("\r", " ")
+            .replace(Regex("\\s+"), " ")
+            .trim()
+
+        if (clean.isBlank()) return clean
+
+        return when (style) {
+            "json" -> {
+                val safe = clean.replace("\"", "'")
+                "{\"answer\":\"$safe\",\"confidence\":\"$confidence\"}"
+            }
+            "bullet" -> clean
+                .split(Regex("(?<=[.!?])\\s+|\\n+"))
+                .map { it.trim() }
+                .filter { it.isNotBlank() }
+                .take(5)
+                .joinToString("\n") { "- $it" }
+            "numbered" -> clean
+                .split(Regex("(?<=[.!?])\\s+|\\n+"))
+                .map { it.trim() }
+                .filter { it.isNotBlank() }
+                .take(5)
+                .mapIndexed { idx, s -> "${idx + 1}. $s" }
+                .joinToString("\n")
+            "brief" -> clean
+                .split(Regex("(?<=[.!?])\\s+"))
+                .firstOrNull()
+                ?.trim()
+                ?: clean
+            else -> clean
+        }
+    }
+
+    private fun isLikelyRelevant(question: String, answer: String): Boolean {
+        val stops = setOf(
+            "what", "when", "where", "who", "how", "is", "are", "was", "were", "do", "does", "did",
+            "a", "an", "the", "to", "for", "of", "in", "on", "my", "me", "you", "please", "about"
+        )
+        val qWords = question.lowercase().split(Regex("[\\s,;.!?]+"))
+            .filter { it.length > 2 && it !in stops }
+            .toSet()
+        if (qWords.isEmpty()) return true
+
+        val aWords = answer.lowercase().split(Regex("[\\s,;.!?]+"))
+            .filter { it.length > 2 }
+            .toSet()
+        val overlap = qWords.count { it in aWords }
+        return overlap >= 1 || answer.lowercase().contains("don't have") || answer.lowercase().contains("couldn't find")
+    }
+
+    private fun collectSpeakerEvidence(limitTurns: Int = 8): List<String> {
+        val out = mutableListOf<String>()
+        val c = readableDatabase.rawQuery(
+            "SELECT raw_text, timestamp FROM conversations ORDER BY rowid DESC LIMIT 4",
+            null
+        )
+        val linePattern = Regex("^([^:\\n]{2,30}):\\s*(.+)$")
+        while (c.moveToNext()) {
+            val raw = c.getString(0) ?: continue
+            val ts = c.getString(1) ?: ""
+            raw.split("\n").forEach { line ->
+                val m = linePattern.find(line.trim()) ?: return@forEach
+                val speaker = m.groupValues[1].trim()
+                val text = cleanDesc(m.groupValues[2].trim())
+                if (speaker.isNotBlank() && text.isNotBlank()) {
+                    out.add("speaker=$speaker | text=$text${if (ts.isNotBlank()) " | time=$ts" else ""}")
+                }
+            }
+            if (out.size >= limitTurns) break
+        }
+        c.close()
+        return out.take(limitTurns)
+    }
+
     // ═══════════════════════════════════════════════════════════
-    //  LLM FORMATTING (optional — reformats pre-computed answer)
+    //  ON-DEVICE FORMATTING (fully offline, no network)
     // ═══════════════════════════════════════════════════════════
 
     private fun formatWithLLM(question: String, result: StructuredResult): Map<String, Any>? {
-        val prompt = """You are a compassionate memory assistant for an Alzheimer patient.
-Reformat the following answer to sound warm, clear, and human.
-
-STRICT RULES:
-- Speak calmly and reassuringly
-- Keep ALL specific details (times, dates, names, counts)
-- Do NOT add new information or invent anything
-- Do NOT show raw transcript text
-- Do NOT use labels like [meeting], [task], [conversation]
-- Remove any duplicate phrases
-- Present appointments as simple bullet points
-- If counting, give the number first
-- Keep response concise (under 100 words)
-- Be warm and human, like a caring family member
-
-COMPUTED ANSWER:
-${result.answer}
-
-PATIENT ASKED: $question
-
-Return JSON only: {"message": "your warm answer", "tone": "calm", "type": "${result.confidence}"}
-JSON:"""
-
-        val url = java.net.URL("http://localhost:11434/api/generate")
-        val conn = url.openConnection() as java.net.HttpURLConnection
-        conn.requestMethod = "POST"
-        conn.setRequestProperty("Content-Type", "application/json")
-        conn.doOutput = true
-        conn.connectTimeout = 3000
-        conn.readTimeout = 20000
-
-        val body = org.json.JSONObject().apply {
-            put("model", "phi3"); put("prompt", prompt); put("stream", false)
-            put("options", org.json.JSONObject().apply { put("temperature", 0.3); put("num_predict", 250) })
-        }
-        conn.outputStream.bufferedWriter().use { it.write(body.toString()) }
-        if (conn.responseCode != 200) return null
-
-        val resp = conn.inputStream.bufferedReader().readText()
-        val llmOut = org.json.JSONObject(resp).optString("response", "")
-        if (llmOut.isBlank()) return null
-
-        // Parse JSON (supports both "answer" and "message" keys)
-        try {
-            val p = org.json.JSONObject(llmOut)
-            val a = p.optString("message", p.optString("answer", ""))
-            if (a.isNotEmpty()) return mapOf("answer" to a, "related_events" to emptyList<Any>(), "confidence" to p.optString("type", p.optString("confidence","medium")), "mode" to "llm")
-        } catch (_: Exception) {}
-
-        val m = Regex("\\{.*\\}", RegexOption.DOT_MATCHES_ALL).find(llmOut)
-        if (m != null) {
-            try {
-                val p = org.json.JSONObject(m.value)
-                val a = p.optString("message", p.optString("answer", ""))
-                if (a.isNotEmpty()) return mapOf("answer" to a, "related_events" to emptyList<Any>(), "confidence" to p.optString("type", p.optString("confidence","medium")), "mode" to "llm")
-            } catch (_: Exception) {}
-        }
-
-        // Use cleaned raw text if substantial
-        val cleaned = llmOut.trim().replace(Regex("\\[meeting]|\\[task]|\\[conversation]|Found \\d+ memory.*?:", RegexOption.IGNORE_CASE), "").trim()
-        if (cleaned.length > 20) return mapOf("answer" to cleaned, "related_events" to emptyList<Any>(), "confidence" to "medium", "mode" to "llm")
-
-        return null
+        val style = detectAnswerStyle(question)
+        val conf = result.confidence.ifBlank { "high" }
+        val msg = applyStyleFallback(result.answer, style, conf)
+        if (!isLikelyRelevant(question, msg)) return null
+        return mapOf(
+            "answer" to msg,
+            "related_events" to emptyList<Any>(),
+            "confidence" to conf,
+            "mode" to "on_device",
+        )
     }
 }

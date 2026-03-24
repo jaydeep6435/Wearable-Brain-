@@ -17,7 +17,6 @@ class _QueryScreenState extends State<QueryScreen> {
   final TextEditingController _questionController = TextEditingController();
   final List<Map<String, String>> _messages = [];
   bool _isLoading = false;
-  bool _useLlm = false;
 
   final List<String> _suggestions = [
     'What meetings do I have tomorrow?',
@@ -38,7 +37,7 @@ class _QueryScreenState extends State<QueryScreen> {
     _questionController.clear();
 
     try {
-      final result = await ApiService.queryMemory(question, useLlm: _useLlm);
+      final result = await ApiService.chatWithMemory(question);
       setState(() {
         _messages.add({'role': 'bot', 'text': result['answer'] ?? 'No answer'});
       });
@@ -57,31 +56,17 @@ class _QueryScreenState extends State<QueryScreen> {
       appBar: AppBar(
         title: const Text('Ask Memory'),
         centerTitle: true,
-        actions: [
-          // LLM toggle in app bar
+        actions: const [
           Padding(
-            padding: const EdgeInsets.only(right: 4),
+            padding: EdgeInsets.only(right: 12),
             child: Row(
               mainAxisSize: MainAxisSize.min,
               children: [
-                Icon(
-                  _useLlm ? Icons.auto_awesome : Icons.flash_on,
-                  size: 16,
-                  color: _useLlm ? Colors.deepPurple : Colors.grey,
-                ),
-                const SizedBox(width: 2),
+                Icon(Icons.auto_awesome, size: 16, color: Colors.deepPurple),
+                SizedBox(width: 4),
                 Text(
-                  _useLlm ? 'AI' : 'Fast',
-                  style: TextStyle(
-                    fontSize: 11,
-                    color: _useLlm ? Colors.deepPurple : Colors.grey,
-                  ),
-                ),
-                Switch(
-                  value: _useLlm,
-                  onChanged: (val) => setState(() => _useLlm = val),
-                  activeThumbColor: Colors.deepPurple,
-                  materialTapTargetSize: MaterialTapTargetSize.shrinkWrap,
+                  'AI',
+                  style: TextStyle(fontSize: 11, color: Colors.deepPurple),
                 ),
               ],
             ),
@@ -98,7 +83,7 @@ class _QueryScreenState extends State<QueryScreen> {
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
                   Text(
-                    _useLlm ? '🤖 AI Mode — Try asking:' : '💡 Try asking:',
+                    '🤖 AI Mode — Try asking:',
                     style: const TextStyle(fontWeight: FontWeight.bold),
                   ),
                   const SizedBox(height: 8),
@@ -170,14 +155,13 @@ class _QueryScreenState extends State<QueryScreen> {
               child: Column(
                 children: [
                   const LinearProgressIndicator(),
-                  if (_useLlm)
-                    const Padding(
-                      padding: EdgeInsets.only(top: 4),
-                      child: Text(
-                        '🤖 AI is thinking...',
-                        style: TextStyle(fontSize: 11, color: Colors.grey),
-                      ),
+                  const Padding(
+                    padding: EdgeInsets.only(top: 4),
+                    child: Text(
+                      '🤖 AI is thinking...',
+                      style: TextStyle(fontSize: 11, color: Colors.grey),
                     ),
+                  ),
                 ],
               ),
             ),
@@ -201,7 +185,7 @@ class _QueryScreenState extends State<QueryScreen> {
                   child: TextField(
                     controller: _questionController,
                     decoration: InputDecoration(
-                      hintText: _useLlm ? 'Ask AI anything...' : 'Ask a question...',
+                      hintText: 'Ask AI anything...',
                       border: OutlineInputBorder(
                         borderRadius: BorderRadius.circular(24),
                       ),
@@ -220,9 +204,7 @@ class _QueryScreenState extends State<QueryScreen> {
                       ? null
                       : () => _askQuestion(_questionController.text),
                   icon: const Icon(Icons.send),
-                  style: _useLlm
-                      ? IconButton.styleFrom(backgroundColor: Colors.deepPurple)
-                      : null,
+                  style: IconButton.styleFrom(backgroundColor: Colors.deepPurple),
                 ),
               ],
             ),

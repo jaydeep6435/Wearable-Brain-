@@ -27,12 +27,16 @@ import io.flutter.embedding.engine.FlutterEngine
 import io.flutter.plugin.common.MethodCall
 import io.flutter.plugin.common.MethodChannel
 import java.io.ByteArrayOutputStream
+import java.io.BufferedReader
 import java.io.File
 import java.io.FileOutputStream
+import java.io.InputStreamReader
 import java.io.RandomAccessFile
+import java.util.Calendar
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
+import org.json.JSONObject
 
 /**
  * MainActivity — Full Voice Pipeline Bridge
@@ -89,8 +93,61 @@ class MainActivity : FlutterActivity() {
     private var scoReceiver: android.content.BroadcastReceiver? = null
     private var pendingBtRecordAction: (() -> Unit)? = null
 
+    // ── On-device answer model status (offline) ─────────────
+    @Volatile private var llmInitializing = false
+    @Volatile private var llmPaused = false
+    @Volatile private var llmReady = false
+    @Volatile private var llmProgress = 0
+    @Volatile private var llmDownloadedMb = 0
+    @Volatile private var llmTotalMb = 1900
+    @Volatile private var llmStage = "idle"
+    @Volatile private var llmError = ""
+    @Volatile private var llmModel = "phi-2.Q4_K_M.gguf"
+    @Volatile private var llmCancelRequested = false
+    @Volatile private var llmEndpoint = "file://app/models/phi2"
+
+    private fun refreshLlmReadyState() {
+        val status = Phi2ModelManager.getStatus(applicationContext)
+        llmReady = status["ready"] == true
+        llmInitializing = status["initializing"] == true
+        llmPaused = status["paused"] == true
+        llmProgress = (status["progress"] as? Number)?.toInt() ?: 0
+        llmDownloadedMb = (status["downloaded_mb"] as? Number)?.toInt() ?: 0
+        llmTotalMb = (status["total_mb"] as? Number)?.toInt() ?: 1900
+        llmStage = (status["stage"] ?: "idle").toString()
+        llmError = (status["error"] ?: "").toString()
+        llmModel = (status["model"] ?: llmModel).toString()
+        llmEndpoint = (status["storage_path"] ?: llmEndpoint).toString()
+    }
+
+    private fun getLlmStatusMap(): Map<String, Any> {
+        return mapOf(
+            "ready" to llmReady,
+            "initializing" to llmInitializing,
+            "paused" to llmPaused,
+            "progress" to llmProgress,
+            "downloaded_mb" to llmDownloadedMb,
+            "total_mb" to llmTotalMb,
+            "stage" to llmStage,
+            "error" to llmError,
+            "model" to llmModel,
+            "endpoint" to llmEndpoint,
+            "candidates" to listOf("file://app/models/phi2"),
+            "status" to if (llmReady) "online" else if (llmInitializing) "downloading" else "offline",
+            "reason" to if (!llmReady && !llmInitializing && llmError.isBlank()) "Phi-2 model not downloaded yet" else ""
+        )
+    }
+
+    private fun startLlmDownload() {
+        Phi2ModelManager.startDownload(applicationContext)
+        refreshLlmReadyState()
+        Log.i(TAG, "Phi-2 local GGUF download requested.")
+    }
+
     override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
         super.configureFlutterEngine(flutterEngine)
+
+        refreshLlmReadyState()
 
         // Initialize real database
         db = MemoryDatabase(applicationContext)
@@ -950,8 +1007,9 @@ class MainActivity : FlutterActivity() {
             )
         }
 
-        val xvector = SherpaTranscriber.extractXVector(wavPath)
-        if (xvector == null) {
+        // maxChunks=0 lets transcriber keep all robust voice-active chunks (up to safety cap).
+        val xvectors = SherpaTranscriber.extractXVectors(wavPath, maxChunks = 0)
+        if (xvectors.isEmpty()) {
             Log.w(TAG, "  ✗ Could not extract voice fingerprint")
             return mapOf(
                 "status" to "error",
@@ -959,16 +1017,193 @@ class MainActivity : FlutterActivity() {
             )
         }
 
-        val profileId = SpeakerEngine.enrollSpeaker(context, name, xvector)
-        Log.i(TAG, "  ✓ Enrolled: $name (id=$profileId)")
+        val profileId = SpeakerEngine.enrollSpeaker(context, name, xvectors)
+        Log.i(TAG, "  ✓ Enrolled: $name (id=$profileId, fingerprints=${xvectors.size})")
         Log.i(TAG, "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
 
         return mapOf(
             "status" to "ok",
             "id" to profileId,
             "name" to name,
+            "fingerprints" to xvectors.size,
             "message" to "Voice enrolled successfully! I'll recognize $name in future conversations."
         )
+    }
+
+    private fun isUnknownSpeakerLabel(label: String): Boolean {
+        return Regex("^Speaker\\s+\\d+$", RegexOption.IGNORE_CASE).matches(label.trim())
+    }
+
+    private fun normalizePersonName(raw: String): String {
+        return raw.lowercase(Locale.US)
+            .split(Regex("\\s+"))
+            .filter { it.isNotBlank() }
+            .joinToString(" ") { token ->
+                token.replaceFirstChar { c -> if (c.isLowerCase()) c.titlecase(Locale.US) else c.toString() }
+            }
+            .trim()
+    }
+
+    private fun extractAddressedNames(text: String): Set<String> {
+        if (text.isBlank()) return emptySet()
+
+        val stop = setOf(
+            "the", "this", "that", "there", "where", "when", "what", "which", "with", "from",
+            "please", "thanks", "thank", "hello", "hi", "hey", "okay", "ok", "listen",
+            "doctor", "sir", "madam", "bro", "sis", "friend", "today", "tomorrow", "weekend",
+            "sure", "later", "around", "time", "call", "quick", "available", "will", "be",
+            "am", "pm", "morning", "evening", "night", "yes", "no", "alright", "fine",
+            "overall", "also", "agree", "agreed", "great", "perfect", "done", "right", "then",
+            "frontend", "backend", "front-end", "back-end", "database", "storage", "module", "modules",
+            "ui", "demo", "review", "testing", "bugs", "submission", "everything",
+            "one", "two", "three", "four", "five", "six", "seven", "eight", "nine", "ten", "eleven", "twelve"
+        )
+
+        val selfIntro = Regex(
+            "\\b(?:my name is|i am|i'm|this is)\\s+([A-Za-z][A-Za-z'-]{1,24}(?:\\s+[A-Za-z][A-Za-z'-]{1,24})?)",
+            RegexOption.IGNORE_CASE
+        )
+        val selfNames = selfIntro.findAll(text)
+            .map { normalizePersonName(it.groupValues[1]) }
+            .toSet()
+
+        val patterns = listOf(
+            Regex("\\b(?:hey|hi|hello|listen|thanks|thank you|ok|okay)\\s+([A-Za-z][A-Za-z'-]{1,24})\\b", RegexOption.IGNORE_CASE),
+            Regex("\\b(?:talking to|speaking to|with)\\s+([A-Za-z][A-Za-z'-]{1,24})\\b", RegexOption.IGNORE_CASE),
+        )
+
+        val out = linkedSetOf<String>()
+        for (rx in patterns) {
+            rx.findAll(text).forEach { m ->
+                val raw = m.groupValues.getOrNull(1)?.trim().orEmpty()
+                if (raw.length < 3) return@forEach
+                val lower = raw
+                    .lowercase(Locale.US)
+                    .replace(Regex("[^a-z'-]"), "")
+                    .trim(' ', '\'', '-')
+                if (lower in stop) return@forEach
+                if (lower.matches(Regex("\\d+"))) return@forEach
+                if (lower.endsWith("am") || lower.endsWith("pm")) return@forEach
+                val normalized = normalizePersonName(raw)
+                if (normalized in selfNames) return@forEach
+                out.add(normalized)
+            }
+        }
+        return out
+    }
+
+    private fun autoNameUnknownSpeakers(
+        context: Context,
+        segments: List<Map<String, Any>>,
+    ): Pair<List<Map<String, Any>>, List<String>> {
+        if (segments.size < 2) return segments to emptyList()
+
+        data class Turn(val speaker: String, val text: String)
+        val turns = segments.mapNotNull { seg ->
+            val speaker = (seg["speaker"] ?: "").toString().trim()
+            val text = (seg["text"] ?: "").toString().trim()
+            if (speaker.isBlank() || text.isBlank()) null else Turn(speaker, text)
+        }
+        if (turns.size < 2) return segments to emptyList()
+
+        val unknownLabels = turns.map { it.speaker }.distinct().filter { isUnknownSpeakerLabel(it) }
+        if (unknownLabels.isEmpty()) return segments to emptyList()
+        val labelTurnCounts = turns.groupingBy { it.speaker }.eachCount()
+
+        val votes = mutableMapOf<String, MutableMap<String, Int>>()
+        for (i in turns.indices) {
+            val names = extractAddressedNames(turns[i].text)
+            if (names.isEmpty()) continue
+
+            fun addVote(targetSpeaker: String, weight: Int) {
+                val bucket = votes.getOrPut(targetSpeaker) { mutableMapOf() }
+                for (name in names) {
+                    bucket[name] = bucket.getOrDefault(name, 0) + weight
+                }
+            }
+
+            var linked = false
+
+            for (step in 1..3) {
+                val j = i + step
+                if (j >= turns.size) break
+                val targetSpeaker = turns[j].speaker
+                if (targetSpeaker.equals(turns[i].speaker, ignoreCase = true)) continue
+
+                val weight = 4 - step // nearer reply gets higher weight
+                addVote(targetSpeaker, weight)
+                linked = true
+                break
+            }
+
+            // If no future reply exists (e.g., name is spoken in the last turn),
+            // map mention to the nearest previous opposing turn.
+            if (!linked) {
+                for (step in 1..3) {
+                    val j = i - step
+                    if (j < 0) break
+                    val targetSpeaker = turns[j].speaker
+                    if (targetSpeaker.equals(turns[i].speaker, ignoreCase = true)) continue
+
+                    val weight = 3 - step
+                    if (weight > 0) {
+                        addVote(targetSpeaker, weight)
+                    }
+                    break
+                }
+            }
+        }
+
+        val tentative = mutableMapOf<String, Pair<String, Int>>()
+        for (label in unknownLabels) {
+            val options = votes[label] ?: continue
+            val best = options.maxByOrNull { it.value } ?: continue
+            if (best.value >= 6) {
+                tentative[label] = best.key to best.value
+            }
+        }
+        if (tentative.isEmpty()) return segments to emptyList()
+
+        val finalMap = mutableMapOf<String, String>()
+        val usedNames = mutableSetOf<String>()
+        tentative.entries
+            .sortedByDescending { it.value.second }
+            .forEach { (label, pair) ->
+                val name = pair.first
+                val key = name.lowercase(Locale.US)
+                if (key !in usedNames) {
+                    usedNames.add(key)
+                    finalMap[label] = name
+                }
+            }
+
+        if (finalMap.isEmpty()) return segments to emptyList()
+
+        val renamed = segments.map { seg ->
+            val speaker = (seg["speaker"] ?: "").toString()
+            val newName = finalMap.entries.firstOrNull { it.key.equals(speaker, ignoreCase = true) }?.value
+            if (newName != null) {
+                seg.toMutableMap().apply { this["speaker"] = newName }
+            } else {
+                seg
+            }
+        }
+
+        val learned = mutableListOf<String>()
+        for ((label, name) in finalMap) {
+            val turnsForLabel = labelTurnCounts[label] ?: 0
+            if (turnsForLabel >= 6) {
+                val profileId = SpeakerEngine.enrollSessionSpeaker(context, label, name)
+                if (!profileId.isNullOrBlank()) {
+                    learned.add(name)
+                    Log.i(TAG, "  ✓ Auto-enrolled from speech mention: $name (from $label, turns=$turnsForLabel)")
+                }
+            } else {
+                Log.i(TAG, "  ↷ Skip auto-enroll for $name from $label (insufficient turns=$turnsForLabel)")
+            }
+        }
+
+        return renamed to learned.distinct()
     }
 
     // ── Process captured text → events → DB ──────────────────
@@ -1010,15 +1245,20 @@ class MainActivity : FlutterActivity() {
 
         // Step 1: Speaker separation
         val (speakerCount, structuredText, speakerSegmentCount) = if (!diarizedSegments.isNullOrEmpty()) {
-            val count = diarizedSegments.map { (it["speaker"] ?: "Speaker 1").toString() }.distinct().size
+            val (namedSegments, learnedNames) = autoNameUnknownSpeakers(this, diarizedSegments)
+            if (learnedNames.isNotEmpty()) {
+                Log.i(TAG, "  Auto-named unknown speaker(s): ${learnedNames.joinToString(", ")}")
+            }
+
+            val count = namedSegments.map { (it["speaker"] ?: "Speaker 1").toString() }.distinct().size
             val structured = if (count > 1) {
-                diarizedSegments.joinToString("\n") {
+                namedSegments.joinToString("\n") {
                     "${(it["speaker"] ?: "Speaker 1")}: ${(it["text"] ?: "").toString()}"
                 }
             } else {
                 text
             }
-            Triple(count, structured, diarizedSegments.size)
+            Triple(count, structured, namedSegments.size)
         } else {
             val speakerSegments = SimpleNlpProcessor.separateSpeakers(text)
             val count = speakerSegments.map { it.speaker }.distinct().size
@@ -1039,6 +1279,18 @@ class MainActivity : FlutterActivity() {
         for (ev in extracted) {
             val saved = db.saveEvent(convId, ev.type, ev.description, ev.date, ev.time, ev.person)
             if (saved != null) savedEvents++
+        }
+
+        // Fallback persistence: if event extractor finds nothing, keep key memory notes searchable.
+        if (savedEvents == 0) {
+            val fallbackNotes = SimpleNlpProcessor.extractKeyPoints(text).take(3)
+            for (note in fallbackNotes) {
+                val saved = db.saveEvent(convId, "note", note, null, null, null)
+                if (saved != null) savedEvents++
+            }
+            if (fallbackNotes.isNotEmpty()) {
+                Log.i(TAG, "  Step 2/4: Added ${fallbackNotes.size} fallback note event(s)")
+            }
         }
         Log.i(TAG, "  Step 2/4: Extracted ${extracted.size}, saved $savedEvents events")
 
@@ -1073,6 +1325,102 @@ class MainActivity : FlutterActivity() {
     // ══════════════════════════════════════════════════════════
     //  METHOD CHANNEL HANDLER
     // ══════════════════════════════════════════════════════════
+
+    private fun parseEventDateTime(rawDate: String?, rawTime: String?): Date? {
+        val datePart = rawDate?.trim().orEmpty()
+        val timePart = rawTime?.trim().orEmpty()
+        if (timePart.isBlank()) return null
+
+        val now = Calendar.getInstance()
+        val eventCal = Calendar.getInstance()
+
+        // Resolve date
+        val lowerDate = datePart.lowercase(Locale.US)
+        when {
+            lowerDate.isBlank() || lowerDate.contains("today") -> {
+                // Keep current day.
+            }
+            lowerDate.contains("tomorrow") -> {
+                eventCal.add(Calendar.DAY_OF_YEAR, 1)
+            }
+            else -> {
+                val datePatterns = listOf(
+                    "yyyy-MM-dd", "yyyy/MM/dd", "dd-MM-yyyy", "dd/MM/yyyy",
+                    "MMM d, yyyy", "MMMM d, yyyy", "MMM d yyyy", "MMMM d yyyy",
+                    "MMM d", "MMMM d", "d MMM", "d MMMM",
+                    "EEE", "EEEE"
+                )
+                var parsedDate: Date? = null
+                for (pattern in datePatterns) {
+                    try {
+                        val fmt = SimpleDateFormat(pattern, Locale.US)
+                        fmt.isLenient = true
+                        parsedDate = fmt.parse(datePart)
+                        if (parsedDate != null) {
+                            val parsedCal = Calendar.getInstance().apply { time = parsedDate }
+                            if (pattern == "EEE" || pattern == "EEEE") {
+                                val targetDow = parsedCal.get(Calendar.DAY_OF_WEEK)
+                                val diff = (targetDow - now.get(Calendar.DAY_OF_WEEK) + 7) % 7
+                                eventCal.time = now.time
+                                eventCal.add(Calendar.DAY_OF_YEAR, if (diff == 0) 7 else diff)
+                            } else {
+                                eventCal.set(Calendar.YEAR, parsedCal.get(Calendar.YEAR))
+                                eventCal.set(Calendar.MONTH, parsedCal.get(Calendar.MONTH))
+                                eventCal.set(Calendar.DAY_OF_MONTH, parsedCal.get(Calendar.DAY_OF_MONTH))
+
+                                // If year was not present in input, prefer current year.
+                                if (!pattern.contains("yyyy")) {
+                                    eventCal.set(Calendar.YEAR, now.get(Calendar.YEAR))
+                                }
+                            }
+                            break
+                        }
+                    } catch (_: Exception) {
+                    }
+                }
+            }
+        }
+
+        // Resolve time
+        val normalizedTime = timePart
+            .replace(Regex("(?i)(\\d)(am|pm)"), "$1 $2")
+            .replace(".", "")
+            .trim()
+
+        val timePatterns = listOf("HH:mm", "H:mm", "h:mm a", "h a", "ha", "HHmm")
+        var parsedTime: Date? = null
+        for (pattern in timePatterns) {
+            try {
+                val fmt = SimpleDateFormat(pattern, Locale.US)
+                fmt.isLenient = true
+                parsedTime = fmt.parse(normalizedTime)
+                if (parsedTime != null) break
+            } catch (_: Exception) {
+            }
+        }
+        if (parsedTime == null) return null
+
+        val timeCal = Calendar.getInstance().apply { time = parsedTime }
+        eventCal.set(Calendar.HOUR_OF_DAY, timeCal.get(Calendar.HOUR_OF_DAY))
+        eventCal.set(Calendar.MINUTE, timeCal.get(Calendar.MINUTE))
+        eventCal.set(Calendar.SECOND, 0)
+        eventCal.set(Calendar.MILLISECOND, 0)
+
+        // If date was implicit/today and time already passed, move to next day.
+        if ((lowerDate.isBlank() || lowerDate.contains("today")) && eventCal.timeInMillis < now.timeInMillis) {
+            eventCal.add(Calendar.DAY_OF_YEAR, 1)
+        }
+
+        return eventCal.time
+    }
+
+    private fun formatDate(date: Date): String {
+        return SimpleDateFormat("yyyy-MM-dd", Locale.US).format(date)
+    }
+
+    private fun formatTime(date: Date): String {
+        return SimpleDateFormat("HH:mm", Locale.US).format(date)
+    }
 
     private fun handleMethodCall(call: MethodCall, result: MethodChannel.Result) {
         Log.d(TAG, "→ MethodCall: ${call.method}")
@@ -1236,7 +1584,13 @@ class MainActivity : FlutterActivity() {
 
                     Thread {
                         // Use diarized transcription
-                        val segments = SherpaTranscriber.transcribeWavWithSpeakers(finalWavPath, ctx)
+                        var segments = SherpaTranscriber.transcribeWavWithSpeakers(finalWavPath, ctx)
+
+                        val autoNamed = autoNameUnknownSpeakers(ctx, segments)
+                        segments = autoNamed.first
+                        if (autoNamed.second.isNotEmpty()) {
+                            Log.i(TAG, "  ✓ Learned new speaker(s): ${autoNamed.second.joinToString(", ")}")
+                        }
 
                         val diarizedTranscript = segments.joinToString(" ") { it["text"].toString() }
                             .replace("\\s+".toRegex(), " ").trim()
@@ -1323,6 +1677,7 @@ class MainActivity : FlutterActivity() {
                     val question = call.argument<String>("question") ?: ""
                     Log.i(TAG, "━━━ queryMemory ━━━━━━━━━━━━━━━━━━━━━")
                     Log.i(TAG, "  Question: '$question'")
+                    Log.i(TAG, "  mode: llm-only")
 
                     if (question.isBlank()) {
                         result.success(mapOf(
@@ -1333,7 +1688,7 @@ class MainActivity : FlutterActivity() {
                         return
                     }
 
-                    val queryResult = db.queryMemory(question)
+                    val queryResult = db.chatWithMemory(question)
                     val answer = queryResult["answer"] as? String ?: ""
                     val resultCount = (queryResult["results"] as? List<*>)?.size ?: 0
                     Log.i(TAG, "  Answer: ${answer.take(80)}...")
@@ -1391,9 +1746,30 @@ class MainActivity : FlutterActivity() {
                 }
 
                 "getUpcoming" -> {
-                    val events = db.getAllEvents()
-                        .filter { it["raw_date"] != null || it["raw_time"] != null }
-                    result.success(mapOf("events" to events, "count" to events.size))
+                    val windowMinutes = call.argument<Int>("minutes") ?: 60
+                    val nowMs = System.currentTimeMillis()
+                    val maxMs = nowMs + windowMinutes * 60_000L
+
+                    val upcoming = db.getAllEvents()
+                        .mapNotNull { event ->
+                            val rawDate = event["raw_date"] as? String
+                            val rawTime = event["raw_time"] as? String
+                            val parsed = parseEventDateTime(rawDate, rawTime) ?: return@mapNotNull null
+                            val eventMs = parsed.time
+                            if (eventMs < nowMs || eventMs > maxMs) return@mapNotNull null
+
+                            val minutesUntil = ((eventMs - nowMs) / 60_000L).toInt()
+                            event.toMutableMap().apply {
+                                put("parsed_date", formatDate(parsed))
+                                put("parsed_time", formatTime(parsed))
+                                put("minutes_until", minutesUntil)
+                                put("event_epoch_ms", eventMs)
+                            }
+                        }
+                        .sortedBy { (it["minutes_until"] as? Int) ?: Int.MAX_VALUE }
+
+                    Log.i(TAG, "getUpcoming($windowMinutes min) -> ${upcoming.size} results")
+                    result.success(mapOf("events" to upcoming, "count" to upcoming.size))
                 }
 
                 // ── Sherpa Status & Controls ──────────────────────────
@@ -1462,14 +1838,7 @@ class MainActivity : FlutterActivity() {
                     val ctx = this
                     Thread {
                         try {
-                            // Transcribe the enrollment audio to get x-vectors
-                            val segments = SherpaTranscriber.transcribeWavWithSpeakers(audioPath, ctx)
-                            
-                            // Extract the x-vectors from the segments
-                            // We need to get them from Sherpa directly
-                            val xvectors = mutableListOf<FloatArray>()
-                            
-                            // Re-process to get raw x-vectors for enrollment
+                            // Process enrollment audio and persist voice profile.
                             val enrollResult = enrollFromAudio(audioPath, name, ctx)
                             
                             runOnUiThread {
@@ -1651,7 +2020,6 @@ class MainActivity : FlutterActivity() {
                 }
 
                 // ── Speakers ──────────────────────────────
-                "getSpeakers" -> result.success(mapOf("speakers" to emptyList<Any>()))
                 "assignSpeaker" -> {
                     result.success(mapOf("status" to "ok",
                         "label" to (call.argument<String>("label") ?: ""),
@@ -1665,10 +2033,38 @@ class MainActivity : FlutterActivity() {
                 "listBackups" -> result.success(emptyList<Any>())
 
                 // ── LLM / Worker ──────────────────────────
-                "checkLlmStatus" -> result.success(mapOf(
-                    "status" to "unavailable",
-                    "reason" to "LLM requires Python runtime"
-                ))
+                "checkLlmStatus" -> {
+                    Thread {
+                        refreshLlmReadyState()
+                        val status = getLlmStatusMap()
+                        mainHandler.post { result.success(status) }
+                    }.start()
+                }
+                "getLlmEndpoint" -> {
+                    result.success(mapOf("endpoint" to llmEndpoint, "candidates" to listOf("file://app/models/phi2")))
+                }
+                "setLlmEndpoint" -> {
+                    result.success(mapOf("status" to "error", "message" to "Endpoint override is disabled in local Phi-2 mode"))
+                }
+                "startLlmDownload" -> {
+                    startLlmDownload()
+                    result.success(mapOf("status" to "started"))
+                }
+                "pauseLlmDownload" -> {
+                    Phi2ModelManager.pauseDownload()
+                    refreshLlmReadyState()
+                    result.success(mapOf("status" to "pausing"))
+                }
+                "resumeLlmDownload" -> {
+                    Phi2ModelManager.resumeDownload(applicationContext)
+                    refreshLlmReadyState()
+                    result.success(mapOf("status" to "resumed"))
+                }
+                "retryLlmDownload" -> {
+                    Phi2ModelManager.retryDownload(applicationContext)
+                    refreshLlmReadyState()
+                    result.success(mapOf("status" to "retrying"))
+                }
 
                 "getWorkerStatus" -> result.success(mapOf(
                     "is_running" to isRecording,
@@ -1684,14 +2080,6 @@ class MainActivity : FlutterActivity() {
                         "memory_mb" to (Runtime.getRuntime().totalMemory() / 1024 / 1024),
                         "free_mb" to (Runtime.getRuntime().freeMemory() / 1024 / 1024)
                     ))
-                }
-
-                "getUrgentItems" -> {
-                    val events = db.getAllEvents().filter {
-                        val t = it["type"] as? String ?: ""
-                        t == "medication" || t == "meeting"
-                    }
-                    result.success(events)
                 }
 
                 "getMemoryPatterns" -> result.success(emptyList<Any>())

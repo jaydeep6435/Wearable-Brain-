@@ -2,7 +2,7 @@
 LLM Engine Module — Local LLM via Ollama
 ==========================================
 Connects to a local Ollama instance (http://localhost:11434) to use
-lightweight LLMs (phi3, mistral) for improved NLP tasks.
+lightweight local LLMs (qwen2.5, phi3, gemma) for improved NLP tasks.
 
 Features:
   - Health check (is Ollama running?)
@@ -16,11 +16,12 @@ is unavailable, so the system can fall back to rule-based methods.
 
 Setup:
   1. Install Ollama: https://ollama.com/download
-  2. Pull a model:   ollama pull phi3
+    2. Pull a model:   ollama pull qwen2.5:3b-instruct
   3. Start server:   ollama serve  (or runs automatically)
 """
 
 import json
+import os
 import re
 import requests
 from datetime import datetime
@@ -31,7 +32,21 @@ from datetime import datetime
 # =========================================================================
 
 OLLAMA_URL = "http://localhost:11434"
-DEFAULT_MODEL = "phi3"      # Lightweight 3.8B — fast on CPU
+DEFAULT_MODEL = os.environ.get("WBRAIN_OLLAMA_MODEL", "qwen2.5:3b-instruct")
+"""Preferred default model for local Ollama generation.
+Can be overridden with WBRAIN_OLLAMA_MODEL.
+"""
+
+# Ordered best-effort model preference list.
+MODEL_PREFERENCE = [
+    "qwen2.5:3b-instruct",
+    "qwen2.5:3b",
+    "phi3:mini",
+    "phi3",
+    "gemma2:2b",
+    "mistral:7b-instruct",
+    "mistral",
+]
 TIMEOUT = 60                # Max seconds to wait for LLM response
 
 
@@ -62,6 +77,52 @@ def get_models() -> list[str]:
         return []
 
 
+def _normalize_model_name(name: str) -> str:
+    """Normalize model names so matching works across :latest suffixes."""
+    return name.lower().strip()
+
+
+def select_model(requested_model: str | None = None) -> str:
+    """Pick the best available local model, preferring lightweight/strong options.
+
+    Resolution order:
+      1) Explicit function argument
+      2) WBRAIN_OLLAMA_MODEL env / DEFAULT_MODEL
+      3) MODEL_PREFERENCE shortlist
+      4) First available Ollama model
+      5) DEFAULT_MODEL (last-resort when tags call fails)
+    """
+    available = get_models()
+    if not available:
+        return requested_model or DEFAULT_MODEL
+
+    normalized = {_normalize_model_name(m): m for m in available}
+
+    candidates = []
+    if requested_model:
+        candidates.append(requested_model)
+    candidates.append(DEFAULT_MODEL)
+    candidates.extend(MODEL_PREFERENCE)
+
+    # Exact / prefix / base-name matching.
+    for candidate in candidates:
+        c = _normalize_model_name(candidate)
+        if c in normalized:
+            return normalized[c]
+
+        for avail_norm, avail_raw in normalized.items():
+            if avail_norm.startswith(c):
+                return avail_raw
+
+        c_base = c.split(":", 1)[0]
+        for avail_norm, avail_raw in normalized.items():
+            if avail_norm.split(":", 1)[0] == c_base:
+                return avail_raw
+
+    # Fallback to first installed model.
+    return available[0]
+
+
 # =========================================================================
 # Core generation
 # =========================================================================
@@ -72,21 +133,24 @@ def generate(prompt: str, model: str = DEFAULT_MODEL) -> str | None:
 
     Args:
         prompt: The text prompt to send.
-        model: Model name (default: phi3).
+        model: Model name (default: auto-selected from local availability).
 
     Returns:
         Generated text string, or None if Ollama is unavailable.
     """
     try:
+        selected_model = select_model(model)
         resp = requests.post(
             f"{OLLAMA_URL}/api/generate",
             json={
-                "model": model,
+                "model": selected_model,
                 "prompt": prompt,
                 "stream": False,
                 "options": {
-                    "temperature": 0.3,     # Lower = more factual
-                    "num_predict": 500,      # Max tokens
+                    "temperature": 0.15,      # Lower = less hallucination
+                    "top_p": 0.9,
+                    "repeat_penalty": 1.1,
+                    "num_predict": 500,       # Max tokens
                 },
             },
             timeout=TIMEOUT,

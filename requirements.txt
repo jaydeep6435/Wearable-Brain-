@@ -1,31 +1,33 @@
-# Wearable Brain - Offline Conversational Memory Assistant
+# =============================================================
+# Wearable Brain -- Offline Conversational Memory Assistant
+# =============================================================
 
-# Core speech pipeline (offline)
+# Core speech pipeline
 faster-whisper>=1.0.0
-pyannote.audio==3.1.1
+pyannote.audio
+openai-whisper
 
-# pyannote 3.1.x compatibility pins (Python 3.11)
-torch==2.10.0
-torchaudio==2.10.0
-numpy<2
-huggingface_hub==0.24.6
+# Torch stack
+torch
+torchaudio
+numpy
 
-# Audio capture / processing
+# Audio processing
 sounddevice
 pydub
+mutagen
 
 # NLP and event parsing
 dateparser
 
-# API and local integration
+# Local API/LLM helpers
 flask
 flask-cors
 requests
 
-# Security and semantic memory utilities
+# Security and semantic search
 cryptography>=41.0
-# Keep transformers stack compatible with huggingface_hub 0.24.x
-sentence-transformers<5
+sentence-transformers>=2.2.0
 
 # Testing
 pytest

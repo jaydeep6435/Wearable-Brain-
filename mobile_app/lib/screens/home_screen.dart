@@ -9,10 +9,10 @@
 /// No developer buttons. No Flask. No technical labels.
 /// Large buttons, calm colors, minimal text.
 
-import 'dart:async';
 import 'package:flutter/material.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import '../services/api_service.dart';
+import '../services/reminder_notification_service.dart';
 
 /// App states for the record screen
 enum AppState { idle, listening, processing, ready }
@@ -33,8 +33,14 @@ class _HomeScreenState extends State<HomeScreen>
   bool _showTextMode = false;
   String _currentSource = 'microphone';
   String _btDeviceName = '';
-  Map<String, dynamic> _sherpaStatus = {};
-  Timer? _sherpaTimer;
+
+  void _dismissResult() {
+    setState(() {
+      _state = AppState.idle;
+      _statusMessage = 'Ready to listen';
+      _lastResult = null;
+    });
+  }
 
   // Pulse animation for listening state
   late AnimationController _pulseController;
@@ -51,29 +57,6 @@ class _HomeScreenState extends State<HomeScreen>
       CurvedAnimation(parent: _pulseController, curve: Curves.easeInOut),
     );
     _loadInitialState();
-    _startStatusTimer();
-  }
-
-  void _startStatusTimer() {
-    // Poll Sherpa status every 5 seconds on home screen
-    _sherpaTimer = Timer.periodic(const Duration(seconds: 5), (timer) async {
-      try {
-        final status = await ApiService.getSherpaStatus();
-        if (!mounted) return;
-        setState(() => _sherpaStatus = status);
-        
-        // If ready, stop fast polling
-        if (status['ready'] == true) {
-          timer.cancel();
-          // Periodically check every 30s just in case
-          _sherpaTimer = Timer.periodic(const Duration(seconds: 30), (t) async {
-            final s = await ApiService.getSherpaStatus();
-            if (!mounted) return;
-            setState(() => _sherpaStatus = s);
-          });
-        }
-      } catch (_) {}
-    });
   }
 
   Future<void> _loadInitialState() async {
@@ -81,12 +64,10 @@ class _HomeScreenState extends State<HomeScreen>
       final prefs = await SharedPreferences.getInstance();
       final saved = prefs.getString('audio_source') ?? 'microphone';
       final info = await ApiService.getAudioSourceInfo();
-      final status = await ApiService.getSherpaStatus();
       if (!mounted) return;
       setState(() {
         _currentSource = saved;
         _btDeviceName = (info['device_name'] ?? '').toString();
-        _sherpaStatus = status;
       });
       // Ensure engine is set to saved source
       await ApiService.setAudioSource(saved);
@@ -133,16 +114,7 @@ class _HomeScreenState extends State<HomeScreen>
         _lastResult = result;
         _statusMessage = 'Done! Memory saved.';
       });
-
-      // Auto-reset after showing result
-      Future.delayed(const Duration(seconds: 8), () {
-        if (mounted && _state == AppState.ready) {
-          setState(() {
-            _state = AppState.idle;
-            _statusMessage = 'Ready to listen';
-          });
-        }
-      });
+      await ReminderNotificationService.instance.refreshSchedules();
     } catch (e) {
       if (!mounted) return;
       setState(() {
@@ -172,15 +144,7 @@ class _HomeScreenState extends State<HomeScreen>
         _lastResult = result;
         _statusMessage = 'Got it! Memory saved.';
       });
-
-      Future.delayed(const Duration(seconds: 8), () {
-        if (mounted && _state == AppState.ready) {
-          setState(() {
-            _state = AppState.idle;
-            _statusMessage = 'Ready to listen';
-          });
-        }
-      });
+      await ReminderNotificationService.instance.refreshSchedules();
     } catch (e) {
       if (!mounted) return;
       setState(() {
@@ -255,8 +219,6 @@ class _HomeScreenState extends State<HomeScreen>
               // ── Result Preview ──
               if (_lastResult != null && _state == AppState.ready)
                 _buildResultPreview(cs),
-
-              _buildSherpaModelProgress(cs),
 
               const Spacer(flex: 2),
             ],
@@ -470,36 +432,50 @@ class _HomeScreenState extends State<HomeScreen>
               ],
             ),
             const SizedBox(height: 12),
-            // ── Show diarized text with speaker labels if available ──
-            if (diarizedText.toString().isNotEmpty)
-              ...[
-                ..._buildDiarizedLines(diarizedText.toString(), cs),
-                if (fullTranscript.toString().trim().isNotEmpty &&
-                    fullTranscript.toString().trim().length > diarizedText.toString().trim().length + 20) ...[
-                  const SizedBox(height: 8),
-                  Text(
-                    fullTranscript.toString(),
-                    style: TextStyle(
-                      fontSize: 14,
-                      height: 1.4,
-                      color: cs.onSurface.withValues(alpha: 0.72),
-                    ),
-                    maxLines: 4,
-                    overflow: TextOverflow.ellipsis,
-                  ),
-                ],
-              ]
-            else
-              Text(
-                summary.toString(),
-                style: TextStyle(
-                  fontSize: 16,
-                  height: 1.5,
-                  color: cs.onSurface.withValues(alpha: 0.8),
+            SizedBox(
+              height: 260,
+              child: Scrollbar(
+                thumbVisibility: true,
+                child: SingleChildScrollView(
+                  child: diarizedText.toString().isNotEmpty
+                      ? Column(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: [
+                            ..._buildDiarizedLines(diarizedText.toString(), cs),
+                            if (fullTranscript.toString().trim().isNotEmpty &&
+                                fullTranscript.toString().trim().length > diarizedText.toString().trim().length + 20) ...[
+                              const SizedBox(height: 8),
+                              Text(
+                                fullTranscript.toString(),
+                                style: TextStyle(
+                                  fontSize: 14,
+                                  height: 1.4,
+                                  color: cs.onSurface.withValues(alpha: 0.72),
+                                ),
+                              ),
+                            ],
+                          ],
+                        )
+                      : Text(
+                          summary.toString(),
+                          style: TextStyle(
+                            fontSize: 16,
+                            height: 1.5,
+                            color: cs.onSurface.withValues(alpha: 0.8),
+                          ),
+                        ),
                 ),
-                maxLines: 6,
-                overflow: TextOverflow.ellipsis,
               ),
+            ),
+            const SizedBox(height: 12),
+            Align(
+              alignment: Alignment.centerRight,
+              child: FilledButton.icon(
+                onPressed: _dismissResult,
+                icon: const Icon(Icons.check, size: 18),
+                label: const Text('Done'),
+              ),
+            ),
           ],
         ),
       ),
@@ -520,7 +496,7 @@ class _HomeScreenState extends State<HomeScreen>
     final Map<String, int> speakerColorMap = {};
     int nextColor = 0;
 
-    return lines.take(8).map((line) {
+    return lines.map((line) {
       final colonIdx = line.indexOf(':');
       if (colonIdx > 0 && colonIdx < 30) {
         final speaker = line.substring(0, colonIdx).trim();
@@ -618,77 +594,6 @@ class _HomeScreenState extends State<HomeScreen>
             ),
           ),
         ],
-      ),
-    );
-  }
-
-  Widget _buildSherpaModelProgress(ColorScheme cs) {
-    final asr = (_sherpaStatus['asr'] is Map)
-        ? Map<String, dynamic>.from(_sherpaStatus['asr'])
-        : <String, dynamic>{};
-
-    if (asr['ready'] == true || _sherpaStatus.isEmpty) {
-      return const SizedBox.shrink();
-    }
-
-    final isInitializing = asr['initializing'] == true;
-    final progress = (asr['progress'] as int? ?? 0);
-    final downloadedMb = (asr['downloaded_mb'] as int? ?? 0);
-    final totalMb = (asr['total_mb'] as int? ?? 0);
-    final errorText = (asr['error'] ?? '').toString();
-    
-    // Only show if it's actually downloading or has an error
-    if (!isInitializing && progress == 0 && errorText.isEmpty) {
-      return const SizedBox.shrink();
-    }
-
-    return Padding(
-      padding: const EdgeInsets.only(top: 16),
-      child: Card(
-        elevation: 0,
-        color: cs.primaryContainer.withValues(alpha: 0.4),
-        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
-        child: Padding(
-          padding: const EdgeInsets.all(16),
-          child: Column(
-            children: [
-              Row(
-                children: [
-                  Icon(Icons.download, color: cs.primary, size: 20),
-                  const SizedBox(width: 8),
-                  Expanded(
-                    child: Text(
-                      isInitializing 
-                        ? (totalMb > 0
-                          ? 'Downloading Speech Model: $downloadedMb / $totalMb MB'
-                          : 'Downloading Speech Model: $progress%')
-                        : errorText.isNotEmpty
-                          ? 'Model Error: $errorText'
-                            : 'Preparing Speech Engine...',
-                      style: TextStyle(
-                        fontSize: 14,
-                        fontWeight: FontWeight.w600,
-                        color: cs.onPrimaryContainer,
-                      ),
-                    ),
-                  ),
-                ],
-              ),
-              if (isInitializing && progress > 0) ...[
-                const SizedBox(height: 12),
-                ClipRRect(
-                  borderRadius: BorderRadius.circular(4),
-                  child: LinearProgressIndicator(
-                    value: (progress.clamp(0, 100)) / 100.0,
-                    backgroundColor: cs.primaryContainer,
-                    color: cs.primary,
-                    minHeight: 6,
-                  ),
-                ),
-              ],
-            ],
-          ),
-        ),
       ),
     );
   }

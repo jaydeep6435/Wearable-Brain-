@@ -10,6 +10,7 @@
 
 import 'dart:async';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import '../services/api_service.dart';
 import 'voice_enrollment_screen.dart';
@@ -22,6 +23,10 @@ class SettingsScreen extends StatefulWidget {
 }
 
 class _SettingsScreenState extends State<SettingsScreen> {
+  static const String _settingsUiBuildTag = '2026-03-24-phi2-local-v2';
+  static const String _phi2DownloadUrl =
+      'https://huggingface.co/TheBloke/phi-2-GGUF/resolve/main/phi-2.Q4_K_M.gguf';
+
   bool _simplifiedMode = false;
   bool _lowResourceMode = false;
   Map<String, dynamic> _stats = {};
@@ -29,6 +34,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
   List<dynamic> _speakers = [];
   Map<String, dynamic> _audioSource = {};
   Map<String, dynamic> _sherpaStatus = {};
+  Map<String, dynamic> _llmStatus = {};
   Timer? _sherpaTimer;
   bool _loading = true;
 
@@ -55,9 +61,11 @@ class _SettingsScreenState extends State<SettingsScreen> {
     _sherpaTimer = Timer.periodic(const Duration(seconds: 2), (timer) async {
       try {
         final status = await ApiService.getSherpaStatus();
+        final llm = await ApiService.checkLlmStatus();
         if (!mounted) return;
         setState(() {
           _sherpaStatus = status;
+          _llmStatus = llm;
         });
         
         // If ready, slow down polling or stop
@@ -73,9 +81,11 @@ class _SettingsScreenState extends State<SettingsScreen> {
     _sherpaTimer = Timer.periodic(const Duration(seconds: 10), (timer) async {
       try {
         final status = await ApiService.getSherpaStatus();
+        final llm = await ApiService.checkLlmStatus();
         if (!mounted) return;
         setState(() {
           _sherpaStatus = status;
+          _llmStatus = llm;
         });
       } catch (_) {}
     });
@@ -125,8 +135,12 @@ class _SettingsScreenState extends State<SettingsScreen> {
     // Load Sherpa status separately so it never blocks the main settings
     try {
       final sherpa = await ApiService.getSherpaStatus();
+      final llm = await ApiService.checkLlmStatus();
       if (!mounted) return;
-      setState(() => _sherpaStatus = sherpa);
+      setState(() {
+        _sherpaStatus = sherpa;
+        _llmStatus = llm;
+      });
     } catch (_) {
       // Sherpa status will be loaded by the periodic timer
     }
@@ -360,50 +374,132 @@ class _SettingsScreenState extends State<SettingsScreen> {
 
                 // ── Speech & Intelligence ──
                 _buildSectionTitle('Speech & Intelligence', cs),
+                Padding(
+                  padding: const EdgeInsets.only(left: 8, bottom: 10),
+                  child: Text(
+                    'Build: $_settingsUiBuildTag',
+                    style: TextStyle(
+                      fontSize: 12,
+                      color: cs.onSurfaceVariant,
+                      fontStyle: FontStyle.italic,
+                    ),
+                  ),
+                ),
                 
-                // Horizontal scroll view for multiple models
-                SingleChildScrollView(
-                  scrollDirection: Axis.horizontal,
-                  clipBehavior: Clip.none,
+                // Always-visible model cards
+                _buildModelCard(
+                  title: 'High-Accuracy Speech Model',
+                  description: 'Required for offline transcription',
+                  icon: Icons.psychology,
+                  status: _sherpaStatus['asr'] ?? {},
+                  defaultSize: 130,
+                  onStart: ApiService.startAsrDownload,
+                  onPause: ApiService.pauseAsrDownload,
+                  onResume: ApiService.resumeAsrDownload,
+                  onRetry: ApiService.retryAsrDownload,
+                  cs: cs,
+                ),
+                const SizedBox(height: 12),
+                _buildModelCard(
+                  title: 'Speaker Identification Model',
+                  description: 'Identifies WHO is speaking',
+                  icon: Icons.record_voice_over,
+                  status: _sherpaStatus['spk'] ?? {},
+                  defaultSize: 12,
+                  onStart: ApiService.startSpkDownload,
+                  onPause: ApiService.pauseSpkDownload,
+                  onResume: ApiService.resumeSpkDownload,
+                  onRetry: ApiService.retrySpkDownload,
+                  cs: cs,
+                ),
+                const SizedBox(height: 12),
+                Container(
+                  width: double.infinity,
+                  margin: const EdgeInsets.only(bottom: 8),
+                  padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+                  decoration: BoxDecoration(
+                    color: cs.primaryContainer.withValues(alpha: 0.35),
+                    borderRadius: BorderRadius.circular(12),
+                    border: Border.all(color: cs.primary.withValues(alpha: 0.25)),
+                  ),
                   child: Row(
                     children: [
-                      // ASR Model Card (Speech)
-                      SizedBox(
-                        width: MediaQuery.of(context).size.width * 0.85,
-                        child: _buildModelCard(
-                          title: 'High-Accuracy Speech Model',
-                          description: 'Required for offline transcription',
-                          icon: Icons.psychology,
-                          status: _sherpaStatus['asr'] ?? {},
-                          defaultSize: 130,
-                          onStart: ApiService.startAsrDownload,
-                          onPause: ApiService.pauseAsrDownload,
-                          onResume: ApiService.resumeAsrDownload,
-                          onRetry: ApiService.retryAsrDownload,
-                          cs: cs,
-                        ),
-                      ),
-                      const SizedBox(width: 12),
-                      
-                      // SPK Model Card (Speaker ID)
-                      SizedBox(
-                        width: MediaQuery.of(context).size.width * 0.85,
-                        child: _buildModelCard(
-                          title: 'Speaker Identification Model',
-                          description: 'Identifies WHO is speaking',
-                          icon: Icons.record_voice_over,
-                          status: _sherpaStatus['spk'] ?? {},
-                          defaultSize: 12,
-                          onStart: ApiService.startSpkDownload,
-                          onPause: ApiService.pauseSpkDownload,
-                          onResume: ApiService.resumeSpkDownload,
-                          onRetry: ApiService.retrySpkDownload,
-                          cs: cs,
+                      Icon(Icons.smart_toy, size: 18, color: cs.primary),
+                      const SizedBox(width: 8),
+                      Expanded(
+                        child: Text(
+                          'Offline Phi-2 model controls',
+                          style: TextStyle(
+                            fontSize: 13,
+                            fontWeight: FontWeight.w600,
+                            color: cs.primary,
+                          ),
                         ),
                       ),
                     ],
                   ),
                 ),
+                _buildModelCard(
+                  title: 'Local AI Answer Model (Phi-2 GGUF)',
+                  description: 'Downloads once to phone storage, then works offline',
+                  icon: Icons.smart_toy,
+                  status: _llmStatus,
+                  defaultSize: 1900,
+                  onStart: ApiService.startLlmDownload,
+                  onPause: ApiService.pauseLlmDownload,
+                  onResume: ApiService.resumeLlmDownload,
+                  onRetry: ApiService.retryLlmDownload,
+                  cs: cs,
+                ),
+                const SizedBox(height: 8),
+                Card(
+                  elevation: 0,
+                  shape: RoundedRectangleBorder(
+                    borderRadius: BorderRadius.circular(12),
+                  ),
+                  child: Padding(
+                    padding: const EdgeInsets.all(12),
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        const Text(
+                          'Model source URL',
+                          style: TextStyle(fontSize: 13, fontWeight: FontWeight.w600),
+                        ),
+                        const SizedBox(height: 6),
+                        SelectableText(
+                          _phi2DownloadUrl,
+                          style: TextStyle(fontSize: 12, color: cs.onSurfaceVariant),
+                        ),
+                        const SizedBox(height: 8),
+                        Align(
+                          alignment: Alignment.centerRight,
+                          child: OutlinedButton.icon(
+                            onPressed: () async {
+                              await Clipboard.setData(
+                                const ClipboardData(text: _phi2DownloadUrl),
+                              );
+                              if (!mounted) return;
+                              ScaffoldMessenger.of(context).showSnackBar(
+                                const SnackBar(content: Text('Phi-2 link copied')),
+                              );
+                            },
+                            icon: const Icon(Icons.copy, size: 16),
+                            label: const Text('Copy Link'),
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+                ),
+                if (_llmStatus.isNotEmpty)
+                  Padding(
+                    padding: const EdgeInsets.only(left: 8, right: 8, top: 4),
+                    child: Text(
+                      'LLM status: stage=${_llmStatus['stage'] ?? 'n/a'} | ready=${_llmStatus['ready'] ?? false} | path=${_llmStatus['endpoint'] ?? 'n/a'}',
+                      style: TextStyle(fontSize: 11, color: cs.onSurfaceVariant),
+                    ),
+                  ),
 
                 const SizedBox(height: 24),
 
@@ -720,13 +816,27 @@ class _SettingsScreenState extends State<SettingsScreen> {
     required VoidCallback onRetry,
     required ColorScheme cs,
   }) {
+    int toInt(dynamic value) {
+      if (value is int) return value;
+      if (value is num) return value.toInt();
+      return int.tryParse(value?.toString() ?? '') ?? 0;
+    }
+
     final isReady = status['ready'] == true;
     final isInit = status['initializing'] == true;
     final isPaused = status['paused'] == true;
+    final stage = (status['stage'] ?? '').toString().trim().toLowerCase();
     final error = (status['error'] ?? '').toString();
-    final downloaded = status['downloaded_mb'] ?? 0;
-    final total = (status['total_mb'] ?? 0) > 0 ? status['total_mb'] : defaultSize;
-    final progress = status['progress'] as int? ?? 0;
+    final downloaded = toInt(status['downloaded_mb']);
+    final statusTotal = toInt(status['total_mb']);
+    final hasTotal = statusTotal > 0;
+    final total = hasTotal ? statusTotal : defaultSize;
+    final progress = toInt(status['progress']);
+    final isDownloadingStage = stage == 'downloading';
+    final isExtractingStage = stage == 'extracting';
+    final isLoadingStage = stage == 'loading';
+    final isDownloadComplete = hasTotal && downloaded >= total;
+    final forcePostDownload = isInit && isDownloadComplete;
 
     return Card(
       elevation: 0,
@@ -755,11 +865,23 @@ class _SettingsScreenState extends State<SettingsScreen> {
                         status.isEmpty 
                             ? 'Checking status...'
                             : isReady
-                                ? 'Ready - $description'
+                                ? (downloaded > 0
+                                    ? 'Downloaded ($downloaded MB) • Ready - $description'
+                              : 'Built-in • Ready - $description')
                                 : isPaused
-                                    ? 'Paused at $downloaded MB'
+                                ? (hasTotal
+                                  ? 'Paused at $downloaded / $total MB'
+                                  : 'Paused at $downloaded MB')
+                                    : (isExtractingStage || forcePostDownload)
+                                        ? 'Extracting model files...'
+                                    : isLoadingStage
+                                        ? 'Finalizing model setup...'
+                                    : isInit && isDownloadingStage && isDownloadComplete
+                                        ? 'Finalizing download...'
                                     : isInit
-                                        ? 'Downloading: $downloaded / $total MB'
+                                  ? (hasTotal
+                                    ? 'Downloading: $downloaded / $total MB'
+                                    : 'Downloading: $downloaded MB')
                                         : error.isNotEmpty
                                             ? 'Failed: $error'
                                             : 'Ready to download (~$defaultSize MB)',
@@ -787,7 +909,9 @@ class _SettingsScreenState extends State<SettingsScreen> {
               ClipRRect(
                 borderRadius: BorderRadius.circular(4),
                 child: LinearProgressIndicator(
-                  value: progress / 100.0,
+                      value: (isDownloadingStage && !isDownloadComplete)
+                      ? (hasTotal ? (progress.clamp(0, 100) / 100.0) : null)
+                      : (isReady ? 1.0 : null),
                   backgroundColor: cs.surfaceContainerHighest,
                   color: isPaused ? cs.outline : cs.primary,
                   minHeight: 8,
@@ -799,7 +923,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
             Row(
               children: [
                 if (!isReady) ...[
-                  if (isInit && !isPaused)
+                  if (isInit && !isPaused && isDownloadingStage && !isDownloadComplete)
                     Expanded(
                       child: OutlinedButton.icon(
                         onPressed: onPause,

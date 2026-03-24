@@ -105,15 +105,8 @@ class ApiService {
     String question, {
     bool useLlm = false,
   }) async {
-    try {
-      final result = await _channel.invokeMapMethod<String, dynamic>(
-        'queryMemory',
-        {'question': question, 'use_llm': useLlm},
-      );
-      return result ?? {};
-    } on PlatformException catch (e) {
-      throw Exception('Failed to query: ${e.message}');
-    }
+    // LLM-only mode: keep this method for compatibility and route to chat endpoint.
+    return chatWithMemory(question);
   }
 
   // ── Events & Reminders ────────────────────────────────────
@@ -418,6 +411,45 @@ class ApiService {
       return result ?? {};
     } catch (_) {
       return {'status': 'error'};
+    }
+  }
+
+  static Future<void> startLlmDownload() async {
+    await _channel.invokeMethod('startLlmDownload');
+  }
+
+  static Future<void> pauseLlmDownload() async {
+    await _channel.invokeMethod('pauseLlmDownload');
+  }
+
+  static Future<void> resumeLlmDownload() async {
+    await _channel.invokeMethod('resumeLlmDownload');
+  }
+
+  static Future<void> retryLlmDownload() async {
+    await _channel.invokeMethod('retryLlmDownload');
+  }
+
+  static Future<Map<String, dynamic>> getLlmEndpoint() async {
+    try {
+      final result = await _channel.invokeMapMethod<String, dynamic>(
+        'getLlmEndpoint',
+      );
+      return result ?? {};
+    } catch (_) {
+      return {};
+    }
+  }
+
+  static Future<Map<String, dynamic>> setLlmEndpoint(String endpoint) async {
+    try {
+      final result = await _channel.invokeMapMethod<String, dynamic>(
+        'setLlmEndpoint',
+        {'endpoint': endpoint},
+      );
+      return result ?? {};
+    } catch (e) {
+      return {'status': 'error', 'message': e.toString()};
     }
   }
 

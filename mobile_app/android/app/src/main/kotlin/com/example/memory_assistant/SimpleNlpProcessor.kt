@@ -50,6 +50,19 @@ object SimpleNlpProcessor {
         """\b(Dr\.?\s+[A-Z][a-z]+|[A-Z][a-z]{2,}(?:\s+[A-Z][a-z]+)?)\b"""
     )
 
+    private val PERSON_STOP_WORDS = setOf(
+        "yes", "no", "also", "maybe", "okay", "ok", "alright", "right",
+        "great", "perfect", "sure", "good", "then", "done"
+    )
+
+    private fun extractPerson(sentence: String): String? {
+        val raw = PERSON_REGEX.find(sentence)?.value?.trim() ?: return null
+        val normalized = raw.lowercase()
+        if (normalized in PERSON_STOP_WORDS) return null
+        if (normalized.matches(Regex("^(speaker)\\s+\\d+$"))) return null
+        return raw
+    }
+
     // ── Extract events from text ─────────────────────────────
 
     data class ExtractedEvent(
@@ -81,7 +94,7 @@ object SimpleNlpProcessor {
             if (type != null) {
                 val time = TIME_REGEX.find(sentence)?.value
                 val date = DATE_REGEX.find(sentence)?.value
-                val person = PERSON_REGEX.find(sentence)?.value
+                val person = extractPerson(sentence)
 
                 events.add(ExtractedEvent(
                     type = type,

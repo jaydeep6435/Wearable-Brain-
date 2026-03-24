@@ -23,7 +23,6 @@ Setup:
 
 import os
 import sys
-import traceback
 import warnings
 import wave
 
@@ -48,31 +47,6 @@ def _get_pyannote_pipeline_class():
         return PyannotePipeline
 
     try:
-        # pyannote 3.x expects torchaudio.set_audio_backend, removed in newer
-        # torchaudio versions. Provide a no-op shim for compatibility.
-        try:
-            import torchaudio
-
-            if not hasattr(torchaudio, "set_audio_backend"):
-                def _noop_set_audio_backend(*args, **kwargs):
-                    return None
-
-                torchaudio.set_audio_backend = _noop_set_audio_backend  # type: ignore[attr-defined]
-
-            if not hasattr(torchaudio, "get_audio_backend"):
-                def _noop_get_audio_backend(*args, **kwargs):
-                    return "soundfile"
-
-                torchaudio.get_audio_backend = _noop_get_audio_backend  # type: ignore[attr-defined]
-
-            if not hasattr(torchaudio, "list_audio_backends"):
-                def _noop_list_audio_backends(*args, **kwargs):
-                    return ["soundfile"]
-
-                torchaudio.list_audio_backends = _noop_list_audio_backends  # type: ignore[attr-defined]
-        except Exception:
-            pass
-
         from pyannote.audio import Pipeline as _Pipeline
 
         PyannotePipeline = _Pipeline
@@ -104,7 +78,6 @@ class SpeakerDiarizer:
     # ── Class-level singleton for the pipeline ─────────────────
     _shared_pipeline = None      # Loaded once, shared across instances
     _pipeline_load_attempted = False
-    _last_load_error = ""
 
     def __init__(
         self,
@@ -186,30 +159,17 @@ class SpeakerDiarizer:
 
         try:
             print(f"[Diarizer] Loading model: {self.model_name}")
+            kwargs = {}
+            if self.hf_token:
+                kwargs["token"] = self.hf_token
+
             pipeline_cls = _get_pyannote_pipeline_class()
             if pipeline_cls is None:
                 raise RuntimeError("pyannote is not available in this environment")
 
-            # pyannote API changed auth argument names across versions.
-            if self.hf_token:
-                try:
-                    pipeline = pipeline_cls.from_pretrained(
-                        self.model_name, token=self.hf_token
-                    )
-                except TypeError:
-                    pipeline = pipeline_cls.from_pretrained(
-                        self.model_name, use_auth_token=self.hf_token
-                    )
-            else:
-                pipeline = pipeline_cls.from_pretrained(self.model_name)
-
-            if pipeline is None:
-                raise RuntimeError(
-                    "pyannote model download returned no pipeline. "
-                    "Authenticate with Hugging Face token and accept model terms."
-                )
-
-            SpeakerDiarizer._shared_pipeline = pipeline
+            SpeakerDiarizer._shared_pipeline = pipeline_cls.from_pretrained(
+                self.model_name, **kwargs
+            )
 
             # Force CPU mode
             import torch
@@ -218,25 +178,13 @@ class SpeakerDiarizer:
             print("[Diarizer] Model loaded successfully (CPU, singleton)")
         except Exception as e:
             error_msg = str(e)
-            trace_text = traceback.format_exc()
-            combined_error = f"{error_msg}\n{trace_text}".lower()
-            SpeakerDiarizer._last_load_error = f"{error_msg}\n{trace_text}"
             print(f"[Diarizer] Failed to load model: {error_msg}")
 
-            if (
-                "401" in combined_error
-                or "403" in combined_error
-                or "token" in combined_error
-                or "gated" in combined_error
-                or "authenticate" in combined_error
-            ):
+            if "401" in error_msg or "token" in error_msg.lower():
                 print("[Diarizer] HINT: Set HF_TOKEN environment variable:")
                 print("[Diarizer]   $env:HF_TOKEN='hf_your_token_here'")
                 print("[Diarizer]   Also accept terms at:")
                 print(f"[Diarizer]   https://huggingface.co/{self.model_name}")
-                if "public gated repositories" in combined_error or "403 forbidden" in combined_error:
-                    print("[Diarizer]   Token fix: enable 'Access to public gated repositories' for your fine-grained token")
-                    print("[Diarizer]   And accept terms for dependent model: https://huggingface.co/pyannote/segmentation-3.0")
 
             print("[Diarizer] Falling back to single-speaker mode")
             self._available = False
@@ -291,17 +239,7 @@ class SpeakerDiarizer:
             try:
                 diarization = self._pipeline(audio_path, **params)
             except Exception as path_err:
-                err_text = str(path_err).lower()
-                decode_markers = (
-                    "audiodecoder",
-                    "format not recognised",
-                    "error opening",
-                    "ffmpeg",
-                    "libsndfile",
-                    "soundfile",
-                    "no backend",
-                )
-                if not any(marker in err_text for marker in decode_markers):
+                if "AudioDecoder" not in str(path_err):
                     raise
 
                 waveform = self._load_wav_as_tensor(audio_path, target_sr=16000)
@@ -336,44 +274,27 @@ class SpeakerDiarizer:
 
     @staticmethod
     def _load_wav_as_tensor(audio_path: str, target_sr: int = 16000):
-        """Load audio into a torch tensor for pyannote dictionary input."""
+        """Load a PCM WAV file into a torch tensor for pyannote input."""
         try:
             import torch
         except Exception:
             return None
 
-        # First try standard WAV decoding via Python's wave module.
         try:
             with wave.open(audio_path, "rb") as wf:
                 sr = wf.getframerate()
                 channels = wf.getnchannels()
                 sampwidth = wf.getsampwidth()
                 raw = wf.readframes(wf.getnframes())
-            if sampwidth == 2:
-                audio = np.frombuffer(raw, dtype=np.int16).astype(np.float32) / 32768.0
-            elif sampwidth == 1:
-                audio = (np.frombuffer(raw, dtype=np.uint8).astype(np.float32) - 128.0) / 128.0
-            elif sampwidth == 4:
-                audio = np.frombuffer(raw, dtype=np.int32).astype(np.float32) / 2147483648.0
-            else:
-                audio = None
-
-            if audio is None:
-                raise ValueError("Unsupported WAV sample width")
-
-            if channels > 1:
-                audio = audio.reshape(-1, channels).mean(axis=1)
         except Exception:
-            # Fallback for mislabeled/non-RIFF files and compressed formats.
-            try:
-                from pydub import AudioSegment
+            return None
 
-                seg = AudioSegment.from_file(audio_path)
-                seg = seg.set_channels(1).set_frame_rate(target_sr).set_sample_width(2)
-                audio = np.array(seg.get_array_of_samples(), dtype=np.float32) / 32768.0
-                sr = target_sr
-            except Exception:
-                return None
+        if sampwidth != 2:
+            return None
+
+        audio = np.frombuffer(raw, dtype=np.int16).astype(np.float32) / 32768.0
+        if channels > 1:
+            audio = audio.reshape(-1, channels).mean(axis=1)
 
         waveform = torch.from_numpy(audio).unsqueeze(0)
         if sr == target_sr:
@@ -518,12 +439,7 @@ class SpeakerDiarizer:
 
         # Method 2: mutagen (if installed)
         try:
-            import importlib
-
-            mutagen = importlib.import_module("mutagen")
-            MutagenFile = getattr(mutagen, "File", None)
-            if MutagenFile is None:
-                raise ImportError("mutagen.File unavailable")
+            from mutagen import File as MutagenFile
             audio = MutagenFile(audio_path)
             if audio and audio.info:
                 return audio.info.length

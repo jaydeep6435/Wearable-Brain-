@@ -1,6 +1,6 @@
 /// Voice Enrollment Screen — Record your voice to create a voice profile
 ///
-/// Flow: Enter name → Read 3 sentences aloud (25s total) → Save voiceprint
+/// Flow: Enter name → Read multiple sentences aloud (up to 90s) → Save voiceprint
 /// The recorded audio is processed by SherpaTranscriber to extract
 /// a 128-dimensional x-vector "voice fingerprint".
 ///
@@ -28,8 +28,8 @@ class _VoiceEnrollmentScreenState extends State<VoiceEnrollmentScreen>
   Timer? _timer;
 
   // ── Recording Configuration ──
-  static const int _totalRecordDuration = 25; // seconds
-  static const int _sentencesPerSession = 3;
+  static const int _totalRecordDuration = 90; // seconds
+  static const int _sentencesPerSession = 10;
 
   // ── Sentence Bank (phonetically rich, covering diverse sounds) ──
   final List<String> _allSentences = [
@@ -140,8 +140,10 @@ class _VoiceEnrollmentScreenState extends State<VoiceEnrollmentScreen>
     _timer = Timer.periodic(const Duration(seconds: 1), (timer) {
       setState(() {
         _recordSeconds++;
-        // Advance sentence every ~8 seconds
-        final nextIdx = (_recordSeconds / 8).floor();
+        // Spread sentence progression across the full enrollment duration.
+        final secondsPerSentence =
+            max(6, (_totalRecordDuration / _sentencesPerSession).ceil());
+        final nextIdx = (_recordSeconds / secondsPerSentence).floor();
         if (nextIdx < _sentencesPerSession && nextIdx != _currentSentenceIndex) {
           _currentSentenceIndex = nextIdx;
         }
@@ -229,7 +231,7 @@ class _VoiceEnrollmentScreenState extends State<VoiceEnrollmentScreen>
               ),
               const SizedBox(height: 8),
               Text(
-                'Read 3 sentences aloud (~25 seconds) so I can\nlearn your unique voice for future recognition.',
+                'Read multiple sentences aloud (up to 90 seconds) so I can\nlearn your unique voice for stronger recognition.',
                 style: TextStyle(fontSize: 15, color: cs.onSurface.withValues(alpha: 0.6)),
                 textAlign: TextAlign.center,
               ),

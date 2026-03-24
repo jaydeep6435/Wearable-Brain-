@@ -135,7 +135,14 @@ class QueryEngine:
                     context = self._format_memory_context()
                     llm_answer = answer_query_llm(question, context)
                     if llm_answer:
-                        return llm_answer
+                        if isinstance(llm_answer, dict):
+                            answer_text = str(llm_answer.get("answer", "")).strip()
+                            if answer_text:
+                                return answer_text
+                        elif isinstance(llm_answer, str):
+                            cleaned = llm_answer.strip()
+                            if cleaned:
+                                return cleaned
             except Exception:
                 pass  # LLM failed — return rule-based result
 

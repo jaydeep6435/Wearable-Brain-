@@ -13,8 +13,11 @@ import 'screens/home_screen.dart';
 import 'screens/query_screen.dart';
 import 'screens/reminder_screen.dart';
 import 'screens/settings_screen.dart';
+import 'services/reminder_notification_service.dart';
 
-void main() {
+Future<void> main() async {
+  WidgetsFlutterBinding.ensureInitialized();
+  await ReminderNotificationService.instance.initialize();
   runApp(const MemoryAssistantApp());
 }
 
@@ -58,6 +61,18 @@ class _MainNavigationState extends State<MainNavigation> {
     ReminderScreen(),
     SettingsScreen(),
   ];
+
+  @override
+  void initState() {
+    super.initState();
+    ReminderNotificationService.instance.startMonitoring();
+  }
+
+  @override
+  void dispose() {
+    ReminderNotificationService.instance.stopMonitoring();
+    super.dispose();
+  }
 
   @override
   Widget build(BuildContext context) {
